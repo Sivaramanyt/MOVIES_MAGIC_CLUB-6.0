@@ -1,0 +1,359 @@
+import asyncio
+import logging
+import os
+import re
+from datetime import datetime, timezone
+from typing import Optional
+
+from dotenv import load_dotenv
+from motor.motor_asyncio import AsyncIOMotorClient
+from telethon import Button, TelegramClient, events
+from telethon.errors import MessageIdInvalidError
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("movie-bot")
+
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+MONGO_URI = os.environ["MONGO_URI"]
+MONGO_DB = os.getenv("MONGO_DB", "movie_magic_club")
+STORAGE_CHANNEL_ID = int(os.environ["STORAGE_CHANNEL_ID"])
+ADMIN_IDS = {
+    int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()
+}
+
+client = TelegramClient("movie_magic_club_bot", API_ID, API_HASH)
+mongo = AsyncIOMotorClient(MONGO_URI)
+db = mongo[MONGO_DB]
+movies = db.movies
+
+PAGE_SIZE = 8
+SEARCH_LIMIT = 40
+
+
+def clean_text(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "")).strip()
+
+
+def normalize_title(value: str) -> str:
+    value = value.lower()
+    value = re.sub(r"[^a-z0-9\u0B80-\u0BFF\u0900-\u097F\s]", " ", value)
+    return clean_text(value)
+
+
+def parse_filename(text: str):
+    """Best-effort parser for common filename/caption formats."""
+    text = clean_text(text)
+    year_match = re.search(r"(?:19|20)\d{2}", text)
+    year = int(year_match.group()) if year_match else None
+
+    language = None
+    quality = None
+    for candidate in ("Tamil", "Telugu", "Malayalam", "Kannada", "Hindi", "English", "Bengali", "Marathi"):
+        if re.search(rf"\b{re.escape(candidate)}\b", text, re.I):
+            language = candidate
+            break
+
+    quality_match = re.search(r"\b(2160p|4K|1080p|720p|480p|360p)\b", text, re.I)
+    quality = quality_match.group(1) if quality_match else None
+
+    title = re.sub(r"[._-]+", " ", text)
+    title = re.sub(r"\b(2160p|4K|1080p|720p|480p|360p)\b", " ", title, flags=re.I)
+    if year:
+        title = re.sub(rf"\b{year}\b", " ", title)
+    for lang in ("Tamil", "Telugu", "Malayalam", "Kannada", "Hindi", "English", "Bengali", "Marathi"):
+        title = re.sub(rf"\b{re.escape(lang)}\b", " ", title, flags=re.I)
+    title = clean_text(title)
+    return title or text, year, language, quality
+
+
+def metadata_from_message(message):
+    text = message.raw_text or ""
+    filename = None
+    if message.file:
+        filename = message.file.name
+    source = filename or text or "Unknown"
+    title, year, language, quality = parse_filename(source)
+
+    # Explicit caption fields override filename guesses.
+    for key, pattern in {
+        "year": r"(?:year)\s*[:=-]\s*((?:19|20)\d{2})",
+        "language": r"(?:language|lang)\s*[:=-]\s*([^\n|]+)",
+        "quality": r"(?:quality)\s*[:=-]\s*([^\n|]+)",
+    }.items():
+        match = re.search(pattern, text, re.I)
+        if match:
+            value = clean_text(match.group(1))
+            if key == "year":
+                year = int(value)
+            elif key == "language":
+                language = value
+            else:
+                quality = value
+
+    return {
+        "title": clean_text(title),
+        "title_normalized": normalize_title(title),
+        "year": year,
+        "language": language or "Unknown",
+        "quality": quality or "Unknown",
+        "channel_id": STORAGE_CHANNEL_ID,
+        "message_id": message.id,
+        "filename": filename or "Unknown",
+        "created_at": datetime.now(timezone.utc),
+        "enabled": True,
+    }
+
+
+async def index_message(message):
+    if not message.media or not message.file:
+        return
+    data = metadata_from_message(message)
+    await movies.update_one(
+        {"channel_id": STORAGE_CHANNEL_ID, "message_id": message.id},
+        {"$set": data},
+        upsert=True,
+    )
+    log.info("Indexed: %s | %s | %s | %s", data["title"], data["year"], data["language"], data["quality"])
+
+
+def result_buttons(items):
+    rows = []
+    for item in items:
+        year = item.get("year") or "Unknown year"
+        label = f"{item['title']} ({year})"
+        rows.append([Button.inline(label[:60], data=f"movie:{item['_id']}")])
+    return rows
+
+
+async def search_movies(query: str):
+    normalized = normalize_title(query)
+    if not normalized:
+        return []
+    words = normalized.split()
+    pattern = ".*" + ".*".join(re.escape(w) for w in words) + ".*"
+    cursor = movies.find(
+        {"enabled": True, "title_normalized": {"$regex": pattern}},
+        {"title": 1, "year": 1, "language": 1, "quality": 1, "message_id": 1},
+    ).sort([("year", -1), ("title", 1)]).limit(SEARCH_LIMIT)
+    return await cursor.to_list(length=SEARCH_LIMIT)
+
+
+@client.on(events.NewMessage(pattern=r"^/start$"))
+async def start(event):
+    await event.respond(
+        "🎬 **Movie Magic Club**\n\n"
+        "Send me a movie name and I will help you choose:\n"
+        "1️⃣ Movie / year\n2️⃣ Language\n3️⃣ Quality\n\n"
+        "Then I will send the matching authorized media to this private chat."
+    )
+
+
+@client.on(events.NewMessage(pattern=r"^/cancel$"))
+async def cancel(event):
+    await event.respond("❌ Search cancelled. Send a movie name to search again.")
+
+
+@client.on(events.NewMessage(pattern=r"^/add\s+(.+)$"))
+async def add_existing(event):
+    if event.sender_id not in ADMIN_IDS:
+        return
+    payload = event.pattern_match.group(1)
+    parts = [clean_text(p) for p in payload.split("|")]
+    if len(parts) != 5:
+        await event.respond("Usage: `/add <message_id> | title | year | language | quality`")
+        return
+    message_id, title, year, language, quality = parts
+    try:
+        message_id = int(message_id)
+        year = int(year)
+    except ValueError:
+        await event.respond("Message ID and year must be numbers.")
+        return
+    try:
+        message = await client.get_messages(STORAGE_CHANNEL_ID, ids=message_id)
+    except Exception as exc:
+        log.exception("Cannot read channel message: %s", exc)
+        await event.respond("Could not read that storage-channel message.")
+        return
+    if not message or not message.media:
+        await event.respond("That channel message does not contain media.")
+        return
+    data = {
+        "title": title,
+        "title_normalized": normalize_title(title),
+        "year": year,
+        "language": language,
+        "quality": quality,
+        "channel_id": STORAGE_CHANNEL_ID,
+        "message_id": message_id,
+        "filename": message.file.name if message.file else "Unknown",
+        "created_at": datetime.now(timezone.utc),
+        "enabled": True,
+    }
+    await movies.update_one(
+        {"channel_id": STORAGE_CHANNEL_ID, "message_id": message_id},
+        {"$set": data},
+        upsert=True,
+    )
+    await event.respond(f"✅ Added **{title} ({year})** — {language} — {quality}")
+
+
+@client.on(events.NewMessage)
+async def movie_search(event):
+    if event.raw_text.startswith("/") or not event.is_private:
+        return
+    query = clean_text(event.raw_text)
+    if len(query) < 2:
+        return
+    results = await search_movies(query)
+    if not results:
+        await event.respond("😕 No matching movie found. Try another title.")
+        return
+    await event.respond(
+        "🎬 **Choose a movie**",
+        buttons=result_buttons(results),
+    )
+
+
+@client.on(events.CallbackQuery(pattern=rb"^movie:(.+)$"))
+async def choose_movie(event):
+    movie_id = event.data.decode().split(":", 1)[1]
+    from bson import ObjectId
+    try:
+        doc = await movies.find_one({"_id": ObjectId(movie_id), "enabled": True})
+    except Exception:
+        doc = None
+    if not doc:
+        await event.answer("Movie is no longer available.", alert=True)
+        return
+
+    docs = await movies.find(
+        {"title_normalized": doc["title_normalized"], "year": doc.get("year"), "enabled": True},
+        {"language": 1},
+    ).to_list(length=SEARCH_LIMIT)
+    languages = sorted({d.get("language", "Unknown") for d in docs}, key=str.lower)
+    buttons = [Button.inline(lang[:50], data=f"lang:{doc['_id']}:{i}") for i, lang in enumerate(languages)]
+    await event.edit(
+        f"🎬 **{doc['title']} ({doc.get('year') or 'Unknown year'})**\n\n🌐 Choose language:",
+        buttons=[buttons[i:i + 2] for i in range(0, len(buttons), 2)],
+    )
+    await event.answer()
+    await movies.update_one({"_id": doc["_id"]}, {"$set": {"_languages": languages}})
+
+
+@client.on(events.CallbackQuery(pattern=rb"^lang:([0-9a-f]+):(\d+)$"))
+async def choose_language(event):
+    parts = event.data.decode().split(":")
+    movie_id, lang_index = parts[1], int(parts[2])
+    from bson import ObjectId
+    try:
+        base = await movies.find_one({"_id": ObjectId(movie_id), "enabled": True})
+    except Exception:
+        base = None
+    if not base:
+        await event.answer("Movie is no longer available.", alert=True)
+        return
+
+    language = (base.get("_languages") or ["Unknown"])[lang_index]
+    docs = await movies.find(
+        {"title_normalized": base["title_normalized"], "year": base.get("year"), "language": language, "enabled": True},
+        {"quality": 1},
+    ).to_list(length=SEARCH_LIMIT)
+    qualities = sorted({d.get("quality", "Unknown") for d in docs}, key=str.lower)
+    buttons = [Button.inline(q[:50], data=f"quality:{movie_id}:{lang_index}:{i}") for i, q in enumerate(qualities)]
+    await event.edit(
+        f"🎬 **{base['title']} ({base.get('year') or 'Unknown year'})**\n"
+        f"🌐 Language: **{language}**\n\n📺 Choose quality:",
+        buttons=[buttons[i:i + 2] for i in range(0, len(buttons), 2)],
+    )
+    await event.answer()
+    await movies.update_one({"_id": base["_id"]}, {"$set": {"_selected_language": language, "_qualities": qualities}})
+
+
+@client.on(events.CallbackQuery(pattern=rb"^quality:([0-9a-f]+):(\d+):(\d+)$"))
+async def choose_quality(event):
+    parts = event.data.decode().split(":")
+    movie_id, lang_index, quality_index = parts[1], int(parts[2]), int(parts[3])
+    from bson import ObjectId
+    try:
+        base = await movies.find_one({"_id": ObjectId(movie_id), "enabled": True})
+    except Exception:
+        base = None
+    if not base:
+        await event.answer("Movie is no longer available.", alert=True)
+        return
+
+    language = (base.get("_languages") or ["Unknown"])[lang_index]
+    qualities = base.get("_qualities") or ["Unknown"]
+    quality = qualities[quality_index]
+    doc = await movies.find_one({
+        "title_normalized": base["title_normalized"],
+        "year": base.get("year"),
+        "language": language,
+        "quality": quality,
+        "enabled": True,
+    })
+    if not doc:
+        await event.answer("That version is no longer available.", alert=True)
+        return
+
+    await event.edit("📤 Preparing your file... Please wait.")
+    try:
+        # Forward without channel attribution when Telegram/Telethon supports it.
+        await client.forward_messages(
+            event.sender_id,
+            doc["message_id"],
+            from_peer=STORAGE_CHANNEL_ID,
+            drop_author=True,
+        )
+        await event.edit(
+            f"✅ **{doc['title']} ({doc.get('year') or 'Unknown year'})**\n"
+            f"🌐 {language}  •  📺 {quality}\n\n"
+            "File sent above. Enjoy!"
+        )
+    except (MessageIdInvalidError, ValueError) as exc:
+        log.exception("Could not send stored media: %s", exc)
+        await event.edit("⚠️ I could not send that file. The stored channel message may be unavailable.")
+    except Exception as exc:
+        log.exception("Unexpected send error: %s", exc)
+        await event.edit("⚠️ Something went wrong while sending the file. Please try again later.")
+    await event.answer()
+
+
+async def ensure_indexes():
+    await movies.create_index([("title_normalized", 1), ("year", -1)])
+    await movies.create_index([("channel_id", 1), ("message_id", 1)], unique=True)
+    await movies.create_index([("enabled", 1), ("title_normalized", 1)])
+
+
+async def index_recent_channel_messages(limit: int = 100):
+    log.info("Indexing the latest %s storage-channel messages...", limit)
+    count = 0
+    async for message in client.iter_messages(STORAGE_CHANNEL_ID, limit=limit):
+        if message.media and message.file:
+            await index_message(message)
+            count += 1
+    log.info("Indexed %s media messages.", count)
+
+
+async def main():
+    await ensure_indexes()
+    await client.start(bot_token=BOT_TOKEN)
+    me = await client.get_me()
+    log.info("Bot started as @%s", me.username)
+    try:
+        await index_recent_channel_messages()
+    except Exception as exc:
+        log.warning("Initial channel indexing skipped/failed: %s", exc)
+    await client.run_until_disconnected()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
