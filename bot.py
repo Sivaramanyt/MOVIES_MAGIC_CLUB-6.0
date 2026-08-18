@@ -3,6 +3,7 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
+from threading import Thread
 
 from bson import ObjectId
 from dotenv import load_dotenv
@@ -10,7 +11,8 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import Button, TelegramClient, events
 from telethon.errors import MessageIdInvalidError
 
-from dotenv import load_dotenv
+from health_server import run_health_server
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -29,7 +31,6 @@ mongo = AsyncIOMotorClient(MONGO_URI)
 db = mongo[MONGO_DB]
 movies = db.movies
 SEARCH_LIMIT = 40
-
 LANGUAGES = ("Tamil", "Telugu", "Malayalam", "Kannada", "Hindi", "English", "Bengali", "Marathi")
 
 
@@ -113,8 +114,6 @@ async def remove_message(message_id: int):
     )
 
 
-# Telegram bot accounts cannot call GetHistoryRequest. Therefore indexing is
-# event-driven: every new storage-channel media post is indexed immediately.
 @client.on(events.NewMessage(chats=STORAGE_CHANNEL_ID))
 async def storage_channel_new_message(event):
     try:
@@ -131,7 +130,7 @@ async def storage_channel_edited_message(event):
         else:
             await remove_message(event.message.id)
     except Exception:
-        log.exception("Automatic re-indexing failed for message %s", event.message.id)
+        log.exception("Automatic re-indexing failed for edited message %s", event.message.id)
 
 
 @client.on(events.MessageDeleted(chats=STORAGE_CHANNEL_ID))
@@ -235,17 +234,11 @@ async def choose_movie(event):
     if not doc:
         await event.answer("Movie is no longer available.", alert=True)
         return
-    docs = await movies.find(
-        {"title_normalized": doc["title_normalized"], "year": doc.get("year"), "enabled": True},
-        {"language": 1},
-    ).to_list(length=SEARCH_LIMIT)
+    docs = await movies.find({"title_normalized": doc["title_normalized"], "year": doc.get("year"), "enabled": True}, {"language": 1}).to_list(length=SEARCH_LIMIT)
     languages = sorted({d.get("language", "Unknown") for d in docs}, key=str.lower)
     await movies.update_one({"_id": doc["_id"]}, {"$set": {"_languages": languages}})
     buttons = [Button.inline(lang[:50], data=f"lang:{doc['_id']}:{i}") for i, lang in enumerate(languages)]
-    await event.edit(
-        f"🎬 **{doc['title']} ({doc.get('year') or 'Unknown year'})**\n\n🌐 Choose language:",
-        buttons=[buttons[i:i + 2] for i in range(0, len(buttons), 2)],
-    )
+    await event.edit(f"🎬 **{doc['title']} ({doc.get('year') or 'Unknown year'})**\n\n🌐 Choose language:", buttons=[buttons[i:i + 2] for i in range(0, len(buttons), 2)])
     await event.answer()
 
 
@@ -265,17 +258,11 @@ async def choose_language(event):
         await event.answer("Language option expired. Search again.", alert=True)
         return
     language = languages[lang_index]
-    docs = await movies.find(
-        {"title_normalized": base["title_normalized"], "year": base.get("year"), "language": language, "enabled": True},
-        {"quality": 1},
-    ).to_list(length=SEARCH_LIMIT)
+    docs = await movies.find({"title_normalized": base["title_normalized"], "year": base.get("year"), "language": language, "enabled": True}, {"quality": 1}).to_list(length=SEARCH_LIMIT)
     qualities = sorted({d.get("quality", "Unknown") for d in docs}, key=str.lower)
     await movies.update_one({"_id": base["_id"]}, {"$set": {"_selected_language": language, "_qualities": qualities}})
     buttons = [Button.inline(q[:50], data=f"quality:{movie_id}:{lang_index}:{i}") for i, q in enumerate(qualities)]
-    await event.edit(
-        f"🎬 **{base['title']} ({base.get('year') or 'Unknown year'})**\n🌐 Language: **{language}**\n\n📺 Choose quality:",
-        buttons=[buttons[i:i + 2] for i in range(0, len(buttons), 2)],
-    )
+    await event.edit(f"🎬 **{base['title']} ({base.get('year') or 'Unknown year'})**\n🌐 Language: **{language}**\n\n📺 Choose quality:", buttons=[buttons[i:i + 2] for i in range(0, len(buttons), 2)])
     await event.answer()
 
 
@@ -297,13 +284,7 @@ async def choose_quality(event):
         return
     language = languages[lang_index]
     quality = qualities[quality_index]
-    doc = await movies.find_one({
-        "title_normalized": base["title_normalized"],
-        "year": base.get("year"),
-        "language": language,
-        "quality": quality,
-        "enabled": True,
-    })
+    doc = await movies.find_one({"title_normalized": base["title_normalized"], "year": base.get("year"), "language": language, "quality": quality, "enabled": True})
     if not doc:
         await event.answer("That version is no longer available.", alert=True)
         return
@@ -327,6 +308,8 @@ async def ensure_indexes():
 
 
 async def main():
+    Thread(target=run_health_server, daemon=True).start()
+    log.info("Health server started on port %s", os.getenv("PORT", "8000"))
     await client.start(bot_token=BOT_TOKEN)
     me = await client.get_me()
     log.info("Bot started as @%s", me.username)
