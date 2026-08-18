@@ -10,6 +10,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import Button, TelegramClient, events
 from telethon.errors import MessageIdInvalidError
 
+from dotenv import load_dotenv
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -112,6 +113,8 @@ async def remove_message(message_id: int):
     )
 
 
+# Telegram bot accounts cannot call GetHistoryRequest. Therefore indexing is
+# event-driven: every new storage-channel media post is indexed immediately.
 @client.on(events.NewMessage(chats=STORAGE_CHANNEL_ID))
 async def storage_channel_new_message(event):
     try:
@@ -141,11 +144,10 @@ async def storage_channel_deleted_message(event):
 
 
 def result_buttons(items):
-    rows = []
-    for item in items:
-        label = f"{item['title']} ({item.get('year') or 'Unknown year'})"
-        rows.append([Button.inline(label[:60], data=f"movie:{item['_id']}")])
-    return rows
+    return [
+        [Button.inline(f"{item['title']} ({item.get('year') or 'Unknown year'})"[:60], data=f"movie:{item['_id']}")]
+        for item in items
+    ]
 
 
 async def search_movies(query: str):
@@ -238,8 +240,8 @@ async def choose_movie(event):
         {"language": 1},
     ).to_list(length=SEARCH_LIMIT)
     languages = sorted({d.get("language", "Unknown") for d in docs}, key=str.lower)
-    buttons = [Button.inline(lang[:50], data=f"lang:{doc['_id']}:{i}") for i, lang in enumerate(languages)]
     await movies.update_one({"_id": doc["_id"]}, {"$set": {"_languages": languages}})
+    buttons = [Button.inline(lang[:50], data=f"lang:{doc['_id']}:{i}") for i, lang in enumerate(languages)]
     await event.edit(
         f"🎬 **{doc['title']} ({doc.get('year') or 'Unknown year'})**\n\n🌐 Choose language:",
         buttons=[buttons[i:i + 2] for i in range(0, len(buttons), 2)],
@@ -324,24 +326,12 @@ async def ensure_indexes():
     await movies.create_index([("enabled", 1), ("title_normalized", 1)])
 
 
-async def index_recent_channel_messages(limit: int = 100):
-    log.info("Running initial storage-channel sync for latest %s messages...", limit)
-    count = 0
-    async for message in client.iter_messages(STORAGE_CHANNEL_ID, limit=limit):
-        if await index_message(message):
-            count += 1
-    log.info("Initial sync indexed %s media messages.", count)
-
-
 async def main():
     await client.start(bot_token=BOT_TOKEN)
     me = await client.get_me()
     log.info("Bot started as @%s", me.username)
     await ensure_indexes()
-    try:
-        await index_recent_channel_messages()
-    except Exception:
-        log.exception("Initial channel sync failed; automatic indexing remains enabled")
+    log.info("Automatic channel indexing is enabled. Waiting for new storage-channel posts...")
     await client.run_until_disconnected()
 
 
