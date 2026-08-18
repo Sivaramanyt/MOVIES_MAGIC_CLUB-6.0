@@ -30,7 +30,6 @@ movies = db.movies
 SEARCH_LIMIT = 40
 
 LANGUAGES = ("Tamil", "Telugu", "Malayalam", "Kannada", "Hindi", "English", "Bengali", "Marathi")
-QUALITIES = ("2160p", "4K", "1080p", "720p", "480p", "360p")
 
 
 def clean_text(value: str) -> str:
@@ -64,7 +63,6 @@ def metadata_from_message(message):
     filename = message.file.name if message.file else None
     source = filename or caption or "Unknown"
     title, year, language, quality = parse_metadata(source)
-
     overrides = {
         "year": r"(?:year)\s*[:=-]\s*((?:19|20)\d{2})",
         "language": r"(?:language|lang)\s*[:=-]\s*([^\n|]+)",
@@ -80,7 +78,6 @@ def metadata_from_message(message):
                 language = value
             else:
                 quality = value
-
     return {
         "title": title,
         "title_normalized": normalize_title(title),
@@ -96,7 +93,6 @@ def metadata_from_message(message):
 
 
 async def index_message(message):
-    """Insert/update one storage-channel media message in MongoDB."""
     if not message.media or not message.file:
         return False
     data = metadata_from_message(message)
@@ -110,26 +106,20 @@ async def index_message(message):
 
 
 async def remove_message(message_id: int):
-    result = await movies.update_one(
+    await movies.update_one(
         {"channel_id": STORAGE_CHANNEL_ID, "message_id": message_id},
         {"$set": {"enabled": False, "deleted_at": datetime.now(timezone.utc)}},
     )
-    if result.modified_count:
-        log.info("Disabled deleted storage message %s", message_id)
 
 
-# Automatic indexing: every new media post in the configured storage channel is
-# parsed and upserted into MongoDB immediately. No restart or /add is required.
 @client.on(events.NewMessage(chats=STORAGE_CHANNEL_ID))
 async def storage_channel_new_message(event):
     try:
-        if event.message.media and event.message.file:
-            await index_message(event.message)
+        await index_message(event.message)
     except Exception:
         log.exception("Automatic indexing failed for message %s", event.message.id)
 
 
-# Keep MongoDB in sync when an existing storage post is edited.
 @client.on(events.MessageEdited(chats=STORAGE_CHANNEL_ID))
 async def storage_channel_edited_message(event):
     try:
@@ -138,10 +128,9 @@ async def storage_channel_edited_message(event):
         else:
             await remove_message(event.message.id)
     except Exception:
-        log.exception("Automatic re-indexing failed for edited message %s", event.message.id)
+        log.exception("Automatic re-indexing failed for message %s", event.message.id)
 
 
-# Disable catalog entries when a storage-channel post is deleted.
 @client.on(events.MessageDeleted(chats=STORAGE_CHANNEL_ID))
 async def storage_channel_deleted_message(event):
     try:
@@ -152,7 +141,11 @@ async def storage_channel_deleted_message(event):
 
 
 def result_buttons(items):
-    return [[Button.inline(f"{item['title']} ({item.get('year') or 'Unknown year'})"[:60], data=f"movie:{item['_id"]}")] for item in items]
+    rows = []
+    for item in items:
+        label = f"{item['title']} ({item.get('year') or 'Unknown year'})"
+        rows.append([Button.inline(label[:60], data=f"movie:{item['_id']}")])
+    return rows
 
 
 async def search_movies(query: str):
@@ -170,7 +163,7 @@ async def search_movies(query: str):
 
 @client.on(events.NewMessage(pattern=r"^/start$"))
 async def start(event):
-    await event.respond("🎬 **Movie Magic Club**\n\nSend me a movie name and choose movie/year → language → quality. I will then send the matching authorized media to this private chat.")
+    await event.respond("🎬 **Movie Magic Club**\n\nSend a movie name and choose movie/year → language → quality. I will send the matching authorized media to your private chat.")
 
 
 @client.on(events.NewMessage(pattern=r"^/cancel$"))
@@ -188,19 +181,29 @@ async def add_existing(event):
         return
     message_id, title, year, language, quality = parts
     try:
-        message_id, year = int(message_id), int(year)
+        message_id = int(message_id)
+        year = int(year)
         message = await client.get_messages(STORAGE_CHANNEL_ID, ids=message_id)
-    except (ValueError, Exception):
+    except (ValueError, TypeError):
+        await event.respond("Message ID and year must be numbers.")
+        return
+    except Exception:
         await event.respond("Could not read that storage-channel message.")
         return
     if not message or not message.media:
         await event.respond("That channel message does not contain media.")
         return
     data = {
-        "title": title, "title_normalized": normalize_title(title), "year": year,
-        "language": language, "quality": quality, "channel_id": STORAGE_CHANNEL_ID,
-        "message_id": message_id, "filename": message.file.name if message.file else "Unknown",
-        "created_at": datetime.now(timezone.utc), "enabled": True,
+        "title": title,
+        "title_normalized": normalize_title(title),
+        "year": year,
+        "language": language,
+        "quality": quality,
+        "channel_id": STORAGE_CHANNEL_ID,
+        "message_id": message_id,
+        "filename": message.file.name if message.file else "Unknown",
+        "created_at": datetime.now(timezone.utc),
+        "enabled": True,
     }
     await movies.update_one({"channel_id": STORAGE_CHANNEL_ID, "message_id": message_id}, {"$set": data}, upsert=True)
     await event.respond(f"✅ Added **{title} ({year})** — {language} — {quality}")
@@ -223,21 +226,28 @@ async def movie_search(event):
 @client.on(events.CallbackQuery(pattern=rb"^movie:(.+)$"))
 async def choose_movie(event):
     try:
-        doc = await movies.find_one({"_id": ObjectId(event.data.decode().split(":", 1)[1]), "enabled": True})
+        movie_id = event.data.decode().split(":", 1)[1]
+        doc = await movies.find_one({"_id": ObjectId(movie_id), "enabled": True})
     except Exception:
         doc = None
     if not doc:
         await event.answer("Movie is no longer available.", alert=True)
         return
-    docs = await movies.find({"title_normalized": doc["title_normalized"], "year": doc.get("year"), "enabled": True}, {"language": 1}).to_list(length=SEARCH_LIMIT)
+    docs = await movies.find(
+        {"title_normalized": doc["title_normalized"], "year": doc.get("year"), "enabled": True},
+        {"language": 1},
+    ).to_list(length=SEARCH_LIMIT)
     languages = sorted({d.get("language", "Unknown") for d in docs}, key=str.lower)
     buttons = [Button.inline(lang[:50], data=f"lang:{doc['_id']}:{i}") for i, lang in enumerate(languages)]
-    await event.edit(f"🎬 **{doc['title']} ({doc.get('year') or 'Unknown year'})**\n\n🌐 Choose language:", buttons=[buttons[i:i + 2] for i in range(0, len(buttons), 2)])
-    await event.answer()
     await movies.update_one({"_id": doc["_id"]}, {"$set": {"_languages": languages}})
+    await event.edit(
+        f"🎬 **{doc['title']} ({doc.get('year') or 'Unknown year'})**\n\n🌐 Choose language:",
+        buttons=[buttons[i:i + 2] for i in range(0, len(buttons), 2)],
+    )
+    await event.answer()
 
 
-@client.on(events.CallbackQuery(pattern=rb"^lang:([0-9a-f]+):(\d+)$"))
+@client.on(events.CallbackQuery(pattern=rb"^lang:([0-9a-f]{24}):(\d+)$"))
 async def choose_language(event):
     parts = event.data.decode().split(":")
     movie_id, lang_index = parts[1], int(parts[2])
@@ -248,16 +258,26 @@ async def choose_language(event):
     if not base:
         await event.answer("Movie is no longer available.", alert=True)
         return
-    language = (base.get("_languages") or ["Unknown"])[lang_index]
-    docs = await movies.find({"title_normalized": base["title_normalized"], "year": base.get("year"), "language": language, "enabled": True}, {"quality": 1}).to_list(length=SEARCH_LIMIT)
+    languages = base.get("_languages") or []
+    if lang_index >= len(languages):
+        await event.answer("Language option expired. Search again.", alert=True)
+        return
+    language = languages[lang_index]
+    docs = await movies.find(
+        {"title_normalized": base["title_normalized"], "year": base.get("year"), "language": language, "enabled": True},
+        {"quality": 1},
+    ).to_list(length=SEARCH_LIMIT)
     qualities = sorted({d.get("quality", "Unknown") for d in docs}, key=str.lower)
-    buttons = [Button.inline(q[:50], data=f"quality:{movie_id}:{lang_index}:{i}") for i, q in enumerate(qualities)]
-    await event.edit(f"🎬 **{base['title']} ({base.get('year') or 'Unknown year'})**\n🌐 Language: **{language}**\n\n📺 Choose quality:", buttons=[buttons[i:i + 2] for i in range(0, len(buttons), 2)])
-    await event.answer()
     await movies.update_one({"_id": base["_id"]}, {"$set": {"_selected_language": language, "_qualities": qualities}})
+    buttons = [Button.inline(q[:50], data=f"quality:{movie_id}:{lang_index}:{i}") for i, q in enumerate(qualities)]
+    await event.edit(
+        f"🎬 **{base['title']} ({base.get('year') or 'Unknown year'})**\n🌐 Language: **{language}**\n\n📺 Choose quality:",
+        buttons=[buttons[i:i + 2] for i in range(0, len(buttons), 2)],
+    )
+    await event.answer()
 
 
-@client.on(events.CallbackQuery(pattern=rb"^quality:([0-9a-f]+):(\d+):(\d+)$"))
+@client.on(events.CallbackQuery(pattern=rb"^quality:([0-9a-f]{24}):(\d+):(\d+)$"))
 async def choose_quality(event):
     parts = event.data.decode().split(":")
     movie_id, lang_index, quality_index = parts[1], int(parts[2]), int(parts[3])
@@ -268,10 +288,20 @@ async def choose_quality(event):
     if not base:
         await event.answer("Movie is no longer available.", alert=True)
         return
-    language = (base.get("_languages") or ["Unknown"])[lang_index]
-    qualities = base.get("_qualities") or ["Unknown"]
+    languages = base.get("_languages") or []
+    qualities = base.get("_qualities") or []
+    if lang_index >= len(languages) or quality_index >= len(qualities):
+        await event.answer("Selection expired. Search again.", alert=True)
+        return
+    language = languages[lang_index]
     quality = qualities[quality_index]
-    doc = await movies.find_one({"title_normalized": base["title_normalized"], "year": base.get("year"), "language": language, "quality": quality, "enabled": True})
+    doc = await movies.find_one({
+        "title_normalized": base["title_normalized"],
+        "year": base.get("year"),
+        "language": language,
+        "quality": quality,
+        "enabled": True,
+    })
     if not doc:
         await event.answer("That version is no longer available.", alert=True)
         return
@@ -304,10 +334,10 @@ async def index_recent_channel_messages(limit: int = 100):
 
 
 async def main():
-    await ensure_indexes()
     await client.start(bot_token=BOT_TOKEN)
     me = await client.get_me()
     log.info("Bot started as @%s", me.username)
+    await ensure_indexes()
     try:
         await index_recent_channel_messages()
     except Exception:
