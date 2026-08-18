@@ -10,11 +10,11 @@ from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import Button, TelegramClient, events
 from telethon.errors import MessageIdInvalidError
+from telethon.tl.types import PeerChannel
 
 from health_server import run_health_server
 
 load_dotenv()
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("movie-bot")
 
@@ -80,38 +80,20 @@ def metadata_from_message(message):
                 language = value
             else:
                 quality = value
-    return {
-        "title": title,
-        "title_normalized": normalize_title(title),
-        "year": year,
-        "language": language or "Unknown",
-        "quality": quality or "Unknown",
-        "channel_id": STORAGE_CHANNEL_ID,
-        "message_id": message.id,
-        "filename": filename or "Unknown",
-        "created_at": datetime.now(timezone.utc),
-        "enabled": True,
-    }
+    return {"title": title, "title_normalized": normalize_title(title), "year": year, "language": language or "Unknown", "quality": quality or "Unknown", "channel_id": STORAGE_CHANNEL_ID, "message_id": message.id, "filename": filename or "Unknown", "created_at": datetime.now(timezone.utc), "enabled": True}
 
 
 async def index_message(message):
     if not message.media or not message.file:
         return False
     data = metadata_from_message(message)
-    await movies.update_one(
-        {"channel_id": STORAGE_CHANNEL_ID, "message_id": message.id},
-        {"$set": data},
-        upsert=True,
-    )
+    await movies.update_one({"channel_id": STORAGE_CHANNEL_ID, "message_id": message.id}, {"$set": data}, upsert=True)
     log.info("Indexed message %s: %s | %s | %s | %s", message.id, data["title"], data["year"], data["language"], data["quality"])
     return True
 
 
 async def remove_message(message_id: int):
-    await movies.update_one(
-        {"channel_id": STORAGE_CHANNEL_ID, "message_id": message_id},
-        {"$set": {"enabled": False, "deleted_at": datetime.now(timezone.utc)}},
-    )
+    await movies.update_one({"channel_id": STORAGE_CHANNEL_ID, "message_id": message_id}, {"$set": {"enabled": False, "deleted_at": datetime.now(timezone.utc)}})
 
 
 @client.on(events.NewMessage(chats=STORAGE_CHANNEL_ID))
@@ -143,10 +125,7 @@ async def storage_channel_deleted_message(event):
 
 
 def result_buttons(items):
-    return [
-        [Button.inline(f"{item['title']} ({item.get('year') or 'Unknown year'})"[:60], data=f"movie:{item['_id']}")]
-        for item in items
-    ]
+    return [[Button.inline(f"{item['title']} ({item.get('year') or 'Unknown year'})"[:60], data=f"movie:{item['_id']}")] for item in items]
 
 
 async def search_movies(query: str):
@@ -155,16 +134,13 @@ async def search_movies(query: str):
         return []
     words = normalized.split()
     pattern = ".*" + ".*".join(re.escape(w) for w in words) + ".*"
-    cursor = movies.find(
-        {"enabled": True, "title_normalized": {"$regex": pattern}},
-        {"title": 1, "year": 1, "language": 1, "quality": 1, "message_id": 1},
-    ).sort([("year", -1), ("title", 1)]).limit(SEARCH_LIMIT)
+    cursor = movies.find({"enabled": True, "title_normalized": {"$regex": pattern}}, {"title": 1, "year": 1, "language": 1, "quality": 1, "message_id": 1}).sort([("year", -1), ("title", 1)]).limit(SEARCH_LIMIT)
     return await cursor.to_list(length=SEARCH_LIMIT)
 
 
 @client.on(events.NewMessage(pattern=r"^/start$"))
 async def start(event):
-    await event.respond("🎬 **Movie Magic Club**\n\nSend a movie name and choose movie/year → language → quality. I will send the matching authorized media to your private chat.")
+    await event.respond("🎬 **Movie Magic Club**\n\nSend a movie name here or in the movie group. Choose movie/year → language → quality, and I will send the selected file to your private chat.")
 
 
 @client.on(events.NewMessage(pattern=r"^/cancel$"))
@@ -194,25 +170,16 @@ async def add_existing(event):
     if not message or not message.media:
         await event.respond("That channel message does not contain media.")
         return
-    data = {
-        "title": title,
-        "title_normalized": normalize_title(title),
-        "year": year,
-        "language": language,
-        "quality": quality,
-        "channel_id": STORAGE_CHANNEL_ID,
-        "message_id": message_id,
-        "filename": message.file.name if message.file else "Unknown",
-        "created_at": datetime.now(timezone.utc),
-        "enabled": True,
-    }
+    data = {"title": title, "title_normalized": normalize_title(title), "year": year, "language": language, "quality": quality, "channel_id": STORAGE_CHANNEL_ID, "message_id": message_id, "filename": message.file.name if message.file else "Unknown", "created_at": datetime.now(timezone.utc), "enabled": True}
     await movies.update_one({"channel_id": STORAGE_CHANNEL_ID, "message_id": message_id}, {"$set": data}, upsert=True)
     await event.respond(f"✅ Added **{title} ({year})** — {language} — {quality}")
 
 
 @client.on(events.NewMessage)
 async def movie_search(event):
-    if event.raw_text.startswith("/") or not event.is_private:
+    if event.raw_text.startswith("/"):
+        return
+    if not (event.is_private or event.is_group):
         return
     query = clean_text(event.raw_text)
     if len(query) < 2:
