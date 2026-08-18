@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import Button, TelegramClient, events
 from telethon.errors import MessageIdInvalidError
-from telethon.tl.types import PeerChannel
 
 from health_server import run_health_server
 
@@ -32,6 +31,7 @@ db = mongo[MONGO_DB]
 movies = db.movies
 SEARCH_LIMIT = 40
 LANGUAGES = ("Tamil", "Telugu", "Malayalam", "Kannada", "Hindi", "English", "Bengali", "Marathi")
+import_lock = asyncio.Lock()
 
 
 def clean_text(value: str) -> str:
@@ -146,6 +146,35 @@ async def start(event):
 @client.on(events.NewMessage(pattern=r"^/cancel$"))
 async def cancel(event):
     await event.respond("❌ Search cancelled. Send a movie name to search again.")
+
+
+@client.on(events.NewMessage(pattern=r"^/import(?:\s+(\d+))?$"))
+async def import_command(event):
+    if event.sender_id not in ADMIN_IDS:
+        return
+    if import_lock.locked():
+        await event.respond("⏳ An import is already running.")
+        return
+
+    limit_text = event.pattern_match.group(1)
+    limit = int(limit_text) if limit_text else None
+    await event.respond(f"📥 Starting historical channel import{f' (max {limit} messages)' if limit else ''}...\n\nThe bot will remain online while the importer reads the channel history.")
+
+    async def progress(scanned, imported):
+        if scanned % 500 == 0:
+            try:
+                await event.respond(f"📊 Import progress: scanned **{scanned}**, indexed **{imported}** media files.")
+            except Exception:
+                pass
+
+    async with import_lock:
+        try:
+            from historical_import import import_history
+            scanned, imported = await import_history(limit=limit, progress_callback=progress)
+            await event.respond(f"✅ Import complete.\n\n📦 Scanned: **{scanned}**\n🎬 Indexed: **{imported}**")
+        except Exception as exc:
+            log.exception("Historical import failed")
+            await event.respond(f"❌ Import failed: `{type(exc).__name__}: {exc}`")
 
 
 @client.on(events.NewMessage(pattern=r"^/add\s+(.+)$"))
