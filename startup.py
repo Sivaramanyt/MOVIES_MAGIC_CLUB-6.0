@@ -55,6 +55,27 @@ async def auto_repair_broken_records():
         bot_v2.log.exception("Auto-repair failed")
 
 
+async def run_maintenance():
+    """Background metadata maintenance, run once after every startup.
+
+    Step 1 repairs broken records from the live channel (stores their captions).
+    Step 2 re-derives metadata for ALL records from the stored filename+caption
+    with the current parser (guarded — never downgrades a record), so parser
+    improvements propagate to old records automatically.
+    Both steps are idempotent and become fast no-ops once converged.
+    """
+    await auto_repair_broken_records()
+    try:
+        from repair import reparse_stored_records
+        bot_v2.log.info("Reparse: re-deriving metadata for all stored records (guarded)...")
+        async def progress(scanned, changed):
+            bot_v2.log.info("Reparse progress: scanned=%s changed=%s", scanned, changed)
+        stats = await reparse_stored_records(bot_v2, progress=progress)
+        bot_v2.log.info("Reparse complete: %s", stats)
+    except Exception:
+        bot_v2.log.exception("Stored-record reparse failed")
+
+
 async def start_telegram_bot():
     # Do not replace/monkey-patch TelegramClient.start(). Telethon's start()
     # is already awaitable when called from an async event loop. A previous
@@ -79,8 +100,8 @@ async def start_telegram_bot():
     bot_v2.log.info("Automatic channel indexing is enabled. Waiting for new storage-channel posts...")
     bot_v2.log.info("Metadata repair is available via the admin /repair command (no auto-migration runs at startup).")
 
-    # Rebuild old broken records from the channel automatically, in the background.
-    asyncio.create_task(auto_repair_broken_records())
+    # Rebuild/re-derive old record metadata automatically, in the background.
+    asyncio.create_task(run_maintenance())
 
     await bot_v2.client.run_until_disconnected()
 

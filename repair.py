@@ -23,6 +23,7 @@ Safety properties:
 import asyncio
 import logging
 import os
+import types
 from datetime import datetime, timezone
 
 from pymongo import UpdateOne
@@ -146,3 +147,109 @@ async def repair_from_source(bot, full: bool = False, progress=None):
         "processed": processed,
         "updated": updated,
     }
+
+
+# ---------------------------------------------------------------------------
+# Guarded DB-side reparse
+# ---------------------------------------------------------------------------
+# The channel re-read above is only needed for records whose source text was
+# never stored. Everything else can be re-derived cheaply from the stored
+# filename+caption whenever the parser improves (e.g. underscore-separated
+# names, bitrate tokens like "640kbps", resolution-first quality labels).
+# Guards below make sure a reparse can never DOWNGRADE a record.
+
+
+def metadata_from_stored(bot, doc):
+    """Re-derive metadata from a record's stored source text (filename+caption)."""
+    filename = doc.get("filename")
+    if filename in (None, "", "Unknown"):
+        filename = None
+    fake_message = types.SimpleNamespace(
+        id=doc.get("message_id"),
+        media=True,
+        file=types.SimpleNamespace(name=filename),
+        raw_text=doc.get("caption") or "",
+    )
+    return bot.metadata_from_message(fake_message)
+
+
+def _guarded_update(bot, old, new):
+    """Build the $set for a reparse, never making a record worse."""
+    update = {}
+
+    new_title = new.get("title") or ""
+    old_title = old.get("title") or ""
+    title_downgrade = bot.is_junk_title(new_title) and not bot.is_junk_title(old_title)
+    if not title_downgrade and (
+        new_title != old_title or new.get("title_normalized") != old.get("title_normalized")
+    ):
+        update["title"] = new_title
+        update["title_normalized"] = new.get("title_normalized")
+
+    new_languages = [x for x in (new.get("languages") or []) if x and str(x).lower() != "unknown"]
+    old_languages = old.get("languages") or []
+    if isinstance(old_languages, str):
+        old_languages = [old_languages]
+    old_languages_clean = [x for x in old_languages if x and str(x).lower() != "unknown"]
+    if new_languages and set(map(str.lower, new_languages)) != set(map(str.lower, old_languages_clean)):
+        update["languages"] = new["languages"]
+        update["language"] = new.get("language")
+
+    new_quality = new.get("quality") or "Unknown"
+    old_quality = old.get("quality") or "Unknown"
+    if new_quality != old_quality and new_quality != "Unknown":
+        update["quality"] = new_quality
+
+    new_year = new.get("year")
+    # skip year when the source was junk — camera filenames carry the UPLOAD date
+    # ("video_2024-01-15.mp4"), not the movie year
+    if new_year and new_year != old.get("year") and not title_downgrade:
+        update["year"] = int(new_year)
+
+    return update
+
+
+async def reparse_stored_records(bot, progress=None):
+    """Re-derive metadata for every enabled record from its stored filename+caption.
+
+    DB-only (no Telegram calls), guarded against downgrades, idempotent: once
+    all records match the current parser it updates 0 and becomes a fast no-op.
+    """
+    cursor = bot.movies.find(
+        {"enabled": True},
+        {"message_id": 1, "filename": 1, "caption": 1, "title": 1, "title_normalized": 1,
+         "year": 1, "language": 1, "languages": 1, "quality": 1},
+    )
+    scanned = 0
+    changed = 0
+    updated = 0
+    batch = []
+    started = datetime.now(timezone.utc)
+
+    async def flush():
+        nonlocal updated, batch
+        if batch:
+            result = await bot.movies.bulk_write(batch, ordered=False)
+            updated += result.modified_count
+            batch = []
+
+    async for doc in cursor:
+        scanned += 1
+        try:
+            new = metadata_from_stored(bot, doc)
+            update = _guarded_update(bot, doc, new)
+        except Exception:
+            log.exception("Reparse failed for record %s", doc.get("_id"))
+            continue
+        if update:
+            changed += 1
+            batch.append(UpdateOne({"_id": doc["_id"]}, {"$set": update}))
+        if len(batch) >= BATCH_SIZE:
+            await flush()
+        if progress and scanned % 500 == 0:
+            await progress(scanned, changed)
+    await flush()
+
+    elapsed = datetime.now(timezone.utc) - started
+    log.info("Reparse finished: scanned=%s changed=%s updated=%s elapsed=%s", scanned, changed, updated, elapsed)
+    return {"scanned": scanned, "changed": changed, "updated": updated}

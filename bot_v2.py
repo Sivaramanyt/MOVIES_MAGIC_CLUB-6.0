@@ -133,12 +133,66 @@ async def storage_channel_deleted_message(event):
         for message_id in event.deleted_ids: await remove_message(message_id)
     except Exception: log.exception("Automatic delete synchronization failed")
 
-async def search_movie_groups(query: str):
+# Words users type that are never part of the stored movie title — stripped from
+# queries so "leo movie", "leo tamil", "leo 1080p" all find Leo.
+SEARCH_NOISE_WORDS = {
+    "movie", "movies", "film", "films", "full", "download", "watch", "online",
+    "free", "link", "links", "file", "files", "print", "new", "latest", "hd",
+    "dub", "dubbed", "dual", "audio", "part", "cd1", "cd2",
+    "1080p", "720p", "480p", "360p", "2160p", "4k", "uhd", "fhd",
+    "hdrip", "webdl", "web", "webrip", "bluray", "brrip", "dvdrip", "hdtv", "cam",
+} | {lang.lower() for lang in LANGUAGES}
+
+def parse_search_query(query: str):
+    """Split a user query into (title_words, year_hint).
+
+    "leo" -> (["leo"], None)
+    "leo 2023" / "leo movie 2023" / "2023 leo tamil" -> (["leo"], 2023)
+    "leo tamil" -> (["leo"], None)
+    "2018" (a real movie title) -> (["2018"], None)  # lone number stays a title
+    """
     normalized = normalize_title(query)
-    if not normalized: return []
-    pattern = ".*" + ".*".join(re.escape(word) for word in normalized.split()) + ".*"
-    pipeline = [{"$match": {"enabled": True, "title_normalized": {"$regex": pattern}}}, {"$group": {"_id": {"title_normalized": "$title_normalized", "year": "$year"}, "title": {"$first": "$title"}, "year": {"$first": "$year"}, "file_count": {"$sum": 1}, "representative_id": {"$first": "$_id"}}}, {"$sort": {"year": -1, "title": 1}}, {"$limit": SEARCH_LIMIT}]
-    return await movies.aggregate(pipeline).to_list(length=SEARCH_LIMIT)
+    words = normalized.split()
+    if not words:
+        return [], None
+    year = None
+    if len(words) > 1:
+        for w in words:
+            if re.fullmatch(r"(?:19|20)\d{2}", w):
+                year = int(w)
+                break
+    rest = [w for w in words if str(year) != w] if year is not None else words
+    title_words = [w for w in rest if w not in SEARCH_NOISE_WORDS]
+    if not title_words:
+        # query was only noise words (e.g. "tamil movie") — keep it literal
+        title_words = rest or words
+        if not rest:
+            year = None
+    return title_words, year
+
+def movie_groups_pipeline(pattern: str, year=None):
+    match = {"enabled": True, "title_normalized": {"$regex": pattern}}
+    if year is not None:
+        match["year"] = year
+    return [
+        {"$match": match},
+        {"$group": {"_id": {"title_normalized": "$title_normalized", "year": "$year"}, "title": {"$first": "$title"}, "year": {"$first": "$year"}, "file_count": {"$sum": 1}, "representative_id": {"$first": "$_id"}}},
+        {"$sort": {"year": -1, "title": 1}},
+        {"$limit": SEARCH_LIMIT},
+    ]
+
+async def search_movie_groups(query: str):
+    title_words, year = parse_search_query(query)
+    if not title_words:
+        return []
+    pattern = ".*" + ".*".join(re.escape(word) for word in title_words) + ".*"
+    if year is not None:
+        groups = await movies.aggregate(movie_groups_pipeline(pattern, year)).to_list(length=SEARCH_LIMIT)
+        if groups:
+            return groups
+        # no exact-year match — fall back to title-only so a wrong year hint
+        # never hides the movie entirely
+    return await movies.aggregate(movie_groups_pipeline(pattern, None)).to_list(length=SEARCH_LIMIT)
 
 async def get_movie_group(movie_id: ObjectId):
     return await movies.find_one({"_id": movie_id, "enabled": True}, {"title": 1, "title_normalized": 1, "year": 1})
