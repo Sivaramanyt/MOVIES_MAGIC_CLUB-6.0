@@ -9,7 +9,7 @@ from bson import ObjectId
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import Button, TelegramClient, events
-from telethon.errors import MessageIdInvalidError
+from telethon.errors import FloodWaitError, MessageIdInvalidError
 
 from health_server import run_health_server
 
@@ -29,9 +29,18 @@ client = TelegramClient("movie_magic_club_bot", API_ID, API_HASH)
 mongo = AsyncIOMotorClient(MONGO_URI)
 db = mongo[MONGO_DB]
 movies = db.movies
-SEARCH_LIMIT = 40
+SEARCH_LIMIT = 200
 LANGUAGES = ("Tamil", "Telugu", "Malayalam", "Kannada", "Hindi", "English", "Bengali", "Marathi")
 import_lock = asyncio.Lock()
+
+NOISE_WORDS = (
+    "tamilmv", "tamilblasters", "1tamilblasters", "tamilrockers", "isaimini",
+    "hdt", "nf", "webdl", "web", "dl", "webrip", "bluray", "brrip", "hdrip",
+    "dvdrip", "dvdscr", "hdcam", "cam", "proper", "hq", "true", "untouched",
+    "remux", "x264", "x265", "hevc", "avc", "aac", "dd", "dd5", "ddp", "ddp5",
+    "atmos", "mkv", "mp4", "avi", "mov", "dual", "audio", "multi", "sample",
+    "repack", "rip", "subs", "subtitle", "1tamilblasters", "re"
+)
 
 
 def clean_text(value: str) -> str:
@@ -42,6 +51,27 @@ def normalize_title(value: str) -> str:
     value = value.lower()
     value = re.sub(r"[^a-z0-9\u0B80-\u0BFF\u0900-\u097F\s]", " ", value)
     return clean_text(value)
+
+
+def canonical_movie_title(value: str) -> str:
+    """Remove release/source/technical tags so files for one movie share a key."""
+    text = clean_text(value).lower()
+    text = re.sub(r"@[^\s]+", " ", text)
+    text = re.sub(r"\[[^\]]*\]", " ", text)
+    text = re.sub(r"\([^)]*\)", " ", text)
+    text = re.sub(r"\b(?:19|20)\d{2}\b", " ", text)
+    text = re.sub(r"\b(?:2160p|1080p|720p|480p|360p|4k)\b", " ", text, flags=re.I)
+    text = re.sub(r"\b\d+(?:\.\d+)?\s*(?:gb|gib|mb|mib)\b", " ", text, flags=re.I)
+    text = re.sub(r"\b(?:" + "|".join(re.escape(x) for x in NOISE_WORDS) + r")\b", " ", text, flags=re.I)
+    text = re.sub(r"\b\d+\b", " ", text)
+    text = re.sub(r"[._+\-]+", " ", text)
+    text = re.sub(r"[^a-z0-9\u0B80-\u0BFF\u0900-\u097F\s]", " ", text)
+    return clean_text(text)
+
+
+def display_title(value: str) -> str:
+    title = canonical_movie_title(value)
+    return title.title() if title else clean_text(value).title()
 
 
 def parse_metadata(text: str):
@@ -80,20 +110,38 @@ def metadata_from_message(message):
                 language = value
             else:
                 quality = value
-    return {"title": title, "title_normalized": normalize_title(title), "year": year, "language": language or "Unknown", "quality": quality or "Unknown", "channel_id": STORAGE_CHANNEL_ID, "message_id": message.id, "filename": filename or "Unknown", "created_at": datetime.now(timezone.utc), "enabled": True}
+    return {
+        "title": title,
+        "title_normalized": normalize_title(title),
+        "year": year,
+        "language": language or "Unknown",
+        "quality": quality or "Unknown",
+        "channel_id": STORAGE_CHANNEL_ID,
+        "message_id": message.id,
+        "filename": filename or "Unknown",
+        "created_at": datetime.now(timezone.utc),
+        "enabled": True,
+    }
 
 
 async def index_message(message):
     if not message.media or not message.file:
         return False
     data = metadata_from_message(message)
-    await movies.update_one({"channel_id": STORAGE_CHANNEL_ID, "message_id": message.id}, {"$set": data}, upsert=True)
+    await movies.update_one(
+        {"channel_id": STORAGE_CHANNEL_ID, "message_id": message.id},
+        {"$set": data},
+        upsert=True,
+    )
     log.info("Indexed message %s: %s | %s | %s | %s", message.id, data["title"], data["year"], data["language"], data["quality"])
     return True
 
 
 async def remove_message(message_id: int):
-    await movies.update_one({"channel_id": STORAGE_CHANNEL_ID, "message_id": message_id}, {"$set": {"enabled": False, "deleted_at": datetime.now(timezone.utc)}})
+    await movies.update_one(
+        {"channel_id": STORAGE_CHANNEL_ID, "message_id": message_id},
+        {"$set": {"enabled": False, "deleted_at": datetime.now(timezone.utc)}},
+    )
 
 
 @client.on(events.NewMessage(chats=STORAGE_CHANNEL_ID))
@@ -125,7 +173,31 @@ async def storage_channel_deleted_message(event):
 
 
 def result_buttons(items):
-    return [[Button.inline(f"{item['title']} ({item.get('year') or 'Unknown year'})"[:60], data=f"movie:{item['_id']}")] for item in items]
+    return [
+        [Button.inline(
+            f"{item['title']} ({item.get('year') or 'Year unknown'}) • {item['file_count']} files"[:60],
+            data=f"movie:{item['_id']}",
+        )]
+        for item in items
+    ]
+
+
+async def matching_group_docs(doc):
+    """Find all indexed files belonging to the same logical movie/year as doc."""
+    key = canonical_movie_title(doc.get("title") or doc.get("filename") or "")
+    if not key:
+        return [doc]
+    words = key.split()
+    pattern = ".*" + ".*".join(re.escape(w) for w in words) + ".*"
+    query = {"enabled": True, "title_normalized": {"$regex": pattern}}
+    if doc.get("year") is not None:
+        query["year"] = doc["year"]
+    candidates = await movies.find(query).limit(SEARCH_LIMIT).to_list(length=SEARCH_LIMIT)
+    return [
+        item for item in candidates
+        if canonical_movie_title(item.get("title") or item.get("filename") or "") == key
+        and (doc.get("year") is None or item.get("year") == doc.get("year"))
+    ]
 
 
 async def search_movies(query: str):
@@ -134,13 +206,37 @@ async def search_movies(query: str):
         return []
     words = normalized.split()
     pattern = ".*" + ".*".join(re.escape(w) for w in words) + ".*"
-    cursor = movies.find({"enabled": True, "title_normalized": {"$regex": pattern}}, {"title": 1, "year": 1, "language": 1, "quality": 1, "message_id": 1}).sort([("year", -1), ("title", 1)]).limit(SEARCH_LIMIT)
-    return await cursor.to_list(length=SEARCH_LIMIT)
+    cursor = movies.find(
+        {"enabled": True, "title_normalized": {"$regex": pattern}},
+        {"title": 1, "year": 1, "language": 1, "quality": 1, "message_id": 1, "filename": 1},
+    ).sort([("year", -1), ("title", 1)]).limit(SEARCH_LIMIT)
+    docs = await cursor.to_list(length=SEARCH_LIMIT)
+
+    groups = {}
+    for doc in docs:
+        key = canonical_movie_title(doc.get("title") or doc.get("filename") or query)
+        if not key:
+            key = normalize_title(query)
+        group_key = (key, doc.get("year"))
+        if group_key not in groups:
+            groups[group_key] = {
+                "_id": doc["_id"],
+                "title": display_title(key),
+                "year": doc.get("year"),
+                "file_count": 0,
+            }
+        groups[group_key]["file_count"] += 1
+
+    return sorted(groups.values(), key=lambda x: (x.get("year") is None, -(x.get("year") or 0), x["title"].lower()))
 
 
 @client.on(events.NewMessage(pattern=r"^/start$"))
 async def start(event):
-    await event.respond("🎬 **Movie Magic Club**\n\nSend a movie name here or in the movie group. Choose movie/year → language → quality, and I will send the selected file to your private chat.")
+    await event.respond(
+        "🎬 **Movie Magic Club**\n\n"
+        "Send a movie name here or in the movie group. "
+        "Choose movie/year → language → quality, and I will send the selected file to your private chat."
+    )
 
 
 @client.on(events.NewMessage(pattern=r"^/cancel$"))
@@ -158,7 +254,10 @@ async def import_command(event):
 
     limit_text = event.pattern_match.group(1)
     limit = int(limit_text) if limit_text else None
-    await event.respond(f"📥 Starting historical channel import{f' (max {limit} messages)' if limit else ''}...\n\nThe bot will remain online while the importer reads the channel history.")
+    await event.respond(
+        f"📥 Starting historical channel import{f' (max {limit} messages)' if limit else ''}...\n\n"
+        "The bot will remain online while the importer reads the channel history."
+    )
 
     async def progress(scanned, imported):
         if scanned % 500 == 0:
@@ -199,8 +298,23 @@ async def add_existing(event):
     if not message or not message.media:
         await event.respond("That channel message does not contain media.")
         return
-    data = {"title": title, "title_normalized": normalize_title(title), "year": year, "language": language, "quality": quality, "channel_id": STORAGE_CHANNEL_ID, "message_id": message_id, "filename": message.file.name if message.file else "Unknown", "created_at": datetime.now(timezone.utc), "enabled": True}
-    await movies.update_one({"channel_id": STORAGE_CHANNEL_ID, "message_id": message_id}, {"$set": data}, upsert=True)
+    data = {
+        "title": title,
+        "title_normalized": normalize_title(title),
+        "year": year,
+        "language": language,
+        "quality": quality,
+        "channel_id": STORAGE_CHANNEL_ID,
+        "message_id": message_id,
+        "filename": message.file.name if message.file else "Unknown",
+        "created_at": datetime.now(timezone.utc),
+        "enabled": True,
+    }
+    await movies.update_one(
+        {"channel_id": STORAGE_CHANNEL_ID, "message_id": message_id},
+        {"$set": data},
+        upsert=True,
+    )
     await event.respond(f"✅ Added **{title} ({year})** — {language} — {quality}")
 
 
@@ -217,10 +331,14 @@ async def movie_search(event):
     if not results:
         await event.respond("😕 No matching movie found. Try another title.")
         return
-    await event.respond("🎬 **Choose a movie**", buttons=result_buttons(results))
+    count = len(results)
+    await event.respond(
+        f"🎬 **{count} movie{'s' if count != 1 else ''} found**\n\nSelect your movie:",
+        buttons=result_buttons(results),
+    )
 
 
-@client.on(events.CallbackQuery(pattern=rb"^movie:(.+)$"))
+@client.on(events.CallbackQuery(pattern=rb"^movie:([0-9a-f]{24})$"))
 async def choose_movie(event):
     try:
         movie_id = event.data.decode().split(":", 1)[1]
@@ -230,11 +348,22 @@ async def choose_movie(event):
     if not doc:
         await event.answer("Movie is no longer available.", alert=True)
         return
-    docs = await movies.find({"title_normalized": doc["title_normalized"], "year": doc.get("year"), "enabled": True}, {"language": 1}).to_list(length=SEARCH_LIMIT)
-    languages = sorted({d.get("language", "Unknown") for d in docs}, key=str.lower)
-    await movies.update_one({"_id": doc["_id"]}, {"$set": {"_languages": languages}})
+
+    group_docs = await matching_group_docs(doc)
+    if not group_docs:
+        await event.answer("Movie files are no longer available.", alert=True)
+        return
+
+    languages = sorted({d.get("language", "Unknown") for d in group_docs}, key=str.lower)
     buttons = [Button.inline(lang[:50], data=f"lang:{doc['_id']}:{i}") for i, lang in enumerate(languages)]
-    await event.edit(f"🎬 **{doc['title']} ({doc.get('year') or 'Unknown year'})**\n\n🌐 Choose language:", buttons=[buttons[i:i + 2] for i in range(0, len(buttons), 2)])
+    title = display_title(doc.get("title") or doc.get("filename") or "Movie")
+    year = doc.get("year") or "Year unknown"
+    await event.edit(
+        f"🎬 **{title} ({year})**\n"
+        f"📁 **{len(group_docs)} files found**\n\n"
+        "🌐 **Select language:**",
+        buttons=[buttons[i:i + 2] for i in range(0, len(buttons), 2)],
+    )
     await event.answer()
 
 
@@ -249,16 +378,27 @@ async def choose_language(event):
     if not base:
         await event.answer("Movie is no longer available.", alert=True)
         return
-    languages = base.get("_languages") or []
+
+    group_docs = await matching_group_docs(base)
+    languages = sorted({d.get("language", "Unknown") for d in group_docs}, key=str.lower)
     if lang_index >= len(languages):
         await event.answer("Language option expired. Search again.", alert=True)
         return
     language = languages[lang_index]
-    docs = await movies.find({"title_normalized": base["title_normalized"], "year": base.get("year"), "language": language, "enabled": True}, {"quality": 1}).to_list(length=SEARCH_LIMIT)
-    qualities = sorted({d.get("quality", "Unknown") for d in docs}, key=str.lower)
-    await movies.update_one({"_id": base["_id"]}, {"$set": {"_selected_language": language, "_qualities": qualities}})
+    qualities = sorted(
+        {d.get("quality", "Unknown") for d in group_docs if d.get("language", "Unknown") == language},
+        key=str.lower,
+    )
     buttons = [Button.inline(q[:50], data=f"quality:{movie_id}:{lang_index}:{i}") for i, q in enumerate(qualities)]
-    await event.edit(f"🎬 **{base['title']} ({base.get('year') or 'Unknown year'})**\n🌐 Language: **{language}**\n\n📺 Choose quality:", buttons=[buttons[i:i + 2] for i in range(0, len(buttons), 2)])
+    title = display_title(base.get("title") or base.get("filename") or "Movie")
+    year = base.get("year") or "Year unknown"
+    await event.edit(
+        f"🎬 **{title} ({year})**\n"
+        f"📁 **{len(group_docs)} files found**\n"
+        f"🌐 Language: **{language}**\n\n"
+        "📺 **Select quality:**",
+        buttons=[buttons[i:i + 2] for i in range(0, len(buttons), 2)],
+    )
     await event.answer()
 
 
@@ -273,21 +413,40 @@ async def choose_quality(event):
     if not base:
         await event.answer("Movie is no longer available.", alert=True)
         return
-    languages = base.get("_languages") or []
-    qualities = base.get("_qualities") or []
-    if lang_index >= len(languages) or quality_index >= len(qualities):
-        await event.answer("Selection expired. Search again.", alert=True)
+
+    group_docs = await matching_group_docs(base)
+    languages = sorted({d.get("language", "Unknown") for d in group_docs}, key=str.lower)
+    if lang_index >= len(languages):
+        await event.answer("Language option expired. Search again.", alert=True)
         return
     language = languages[lang_index]
+    qualities = sorted(
+        {d.get("quality", "Unknown") for d in group_docs if d.get("language", "Unknown") == language},
+        key=str.lower,
+    )
+    if quality_index >= len(qualities):
+        await event.answer("Quality option expired. Search again.", alert=True)
+        return
     quality = qualities[quality_index]
-    doc = await movies.find_one({"title_normalized": base["title_normalized"], "year": base.get("year"), "language": language, "quality": quality, "enabled": True})
-    if not doc:
+    matching = [
+        d for d in group_docs
+        if d.get("language", "Unknown") == language and d.get("quality", "Unknown") == quality
+    ]
+    if not matching:
         await event.answer("That version is no longer available.", alert=True)
         return
-    await event.edit("📤 Preparing your file... Please wait.")
+    doc = matching[0]
+
+    await event.edit("📤 **Preparing your file...** Please wait.")
     try:
         await client.forward_messages(event.sender_id, doc["message_id"], from_peer=STORAGE_CHANNEL_ID, drop_author=True)
-        await event.edit(f"✅ **{doc['title']} ({doc.get('year') or 'Unknown year'})**\n🌐 {language}  •  📺 {quality}\n\nFile sent above.")
+        title = display_title(doc.get("title") or doc.get("filename") or "Movie")
+        year = doc.get("year") or "Year unknown"
+        await event.edit(
+            f"✅ **{title} ({year})**\n"
+            f"🌐 {language}  •  📺 {quality}\n\n"
+            "File sent above."
+        )
     except (MessageIdInvalidError, ValueError):
         log.exception("Could not send stored media")
         await event.edit("⚠️ I could not send that file. The stored channel message may be unavailable.")
@@ -306,7 +465,13 @@ async def ensure_indexes():
 async def main():
     Thread(target=run_health_server, daemon=True).start()
     log.info("Health server started on port %s", os.getenv("PORT", "8000"))
-    await client.start(bot_token=BOT_TOKEN)
+    while True:
+        try:
+            await client.start(bot_token=BOT_TOKEN)
+            break
+        except FloodWaitError as exc:
+            log.warning("Telegram authorization is rate-limited; waiting %s seconds before retrying.", exc.seconds)
+            await asyncio.sleep(exc.seconds + 5)
     me = await client.get_me()
     log.info("Bot started as @%s", me.username)
     await ensure_indexes()
