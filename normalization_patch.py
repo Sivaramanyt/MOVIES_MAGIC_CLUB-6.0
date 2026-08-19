@@ -25,8 +25,12 @@ def normalize_title(value):
     return clean_text(value)
 
 
+def detect_languages(text):
+    text = clean_text(text)
+    return [lang for lang in LANGUAGES if re.search(rf"\b{re.escape(lang)}\b", text, re.I)]
+
+
 def canonical_movie_title(value):
-    """Return the logical movie title, excluding release/variant metadata."""
     text = clean_text(value).lower()
     text = re.sub(r"@[A-Za-z0-9_]+", " ", text)
     text = re.sub(r"\[[^\]]*\]", " ", text)
@@ -35,7 +39,6 @@ def canonical_movie_title(value):
     text = re.sub(r"\b(?:19|20)\d{2}\b", " ", text)
     text = re.sub(r"\b(?:2160p|1080p|720p|480p|360p|4k|uhd|fhd|hd)\b", " ", text, flags=re.I)
     text = re.sub(r"\b\d+(?:\.\d+)?\s*(?:gb|gib|mb|mib)\b", " ", text, flags=re.I)
-    # Language is a variant, never part of the movie identity.
     text = re.sub(r"\b(?:" + "|".join(re.escape(x) for x in LANGUAGES) + r")\b", " ", text, flags=re.I)
     text = re.sub(r"\b(?:" + "|".join(re.escape(x) for x in NOISE_WORDS) + r")\b", " ", text, flags=re.I)
     text = re.sub(r"\bx\d+\b", " ", text, flags=re.I)
@@ -57,7 +60,7 @@ def parse_metadata(text):
     text = clean_text(text)
     year_match = re.search(r"(?:19|20)\d{2}", text)
     year = int(year_match.group()) if year_match else None
-    language = next((x for x in LANGUAGES if re.search(rf"\b{re.escape(x)}\b", text, re.I)), None)
+    languages = detect_languages(text)
     quality_match = re.search(r"\b(2160p|4K|1080p|720p|480p|360p)\b", text, re.I)
     if quality_match:
         quality = quality_match.group(1)
@@ -70,25 +73,26 @@ def parse_metadata(text):
     else:
         quality = None
     title = canonical_movie_title(text)
-    return display_title(title), year, language, quality
+    return display_title(title), year, languages, quality
 
 
 def install(bot):
     bot.parse_metadata = parse_metadata
     bot.normalize_title = normalize_title
+    bot.detect_languages = detect_languages
 
 
 async def migrate_existing_movies(bot):
-    """Rebuild logical movie titles while retaining language/quality as variants."""
+    """Rebuild titles and language arrays for all existing indexed files."""
     marker = bot.db.movie_magic_meta
-    marker_id = "title_normalization_v5_grouped_variants"
+    marker_id = "title_normalization_v6_multilanguage_variants"
     if await marker.find_one({"_id": marker_id}):
         return 0
 
     docs = []
     cursor = bot.movies.find(
         {"enabled": True},
-        {"_id": 1, "title": 1, "filename": 1, "year": 1, "language": 1, "quality": 1},
+        {"_id": 1, "title": 1, "filename": 1, "year": 1, "language": 1, "languages": 1, "quality": 1},
     )
     async for doc in cursor:
         docs.append(doc)
@@ -97,17 +101,24 @@ async def migrate_existing_movies(bot):
     prepared = []
     for doc in docs:
         source = doc.get("filename") or doc.get("title") or ""
-        parsed_title, parsed_year, parsed_language, parsed_quality = parse_metadata(source)
+        parsed_title, parsed_year, parsed_languages, parsed_quality = parse_metadata(source)
         if parsed_title == "Unknown title":
             parsed_title = display_title(doc.get("title") or source)
         year = doc.get("year") or parsed_year
+        languages = parsed_languages
+        if not languages:
+            old_languages = doc.get("languages") or []
+            if isinstance(old_languages, str):
+                old_languages = [old_languages]
+            languages = [x for x in old_languages if x] or ([doc.get("language")] if doc.get("language") else [])
+        languages = list(dict.fromkeys(languages)) or ["Unknown"]
         if year:
             known_years[normalize_title(parsed_title)][int(year)] += 1
-        prepared.append((doc, parsed_title, year, parsed_language, parsed_quality))
+        prepared.append((doc, parsed_title, year, languages, parsed_quality))
 
     updated = 0
     now = datetime.now(timezone.utc)
-    for doc, title, year, parsed_language, parsed_quality in prepared:
+    for doc, title, year, languages, parsed_quality in prepared:
         key = normalize_title(title)
         if not year and key in known_years and len(known_years[key]) == 1:
             year = next(iter(known_years[key]))
@@ -115,12 +126,12 @@ async def migrate_existing_movies(bot):
         update = {
             "title": title,
             "title_normalized": key,
+            "languages": languages,
+            "language": languages[0],
             "title_normalized_at": now,
         }
         if year and doc.get("year") != year:
             update["year"] = int(year)
-        if (not doc.get("language") or doc.get("language") == "Unknown") and parsed_language:
-            update["language"] = parsed_language
         if (not doc.get("quality") or doc.get("quality") == "Unknown") and parsed_quality:
             update["quality"] = parsed_quality
 
