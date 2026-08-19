@@ -15,27 +15,21 @@ NOISE_WORDS = (
 )
 LANGUAGES = ("Tamil", "Telugu", "Malayalam", "Kannada", "Hindi", "English", "Bengali", "Marathi")
 
-
 def clean_text(value):
     return re.sub(r"\s+", " ", value or "").strip()
 
-
 def detect_languages(text):
-    """Detect every supported language, including '#Hindi' and '[Malayalam + Kannada]'."""
     text = clean_text(text)
     found = []
     for lang in LANGUAGES:
-        # Do not rely on \b because filenames often put #, [, +, or - directly next to names.
         if re.search(rf"(?<![A-Za-z]){re.escape(lang)}(?![A-Za-z])", text, re.I):
             found.append(lang)
     return found
-
 
 def normalize_title(value):
     value = (value or "").lower()
     value = re.sub(r"[^a-z0-9\u0B80-\u0BFF\u0900-\u097F\s]", " ", value)
     return clean_text(value)
-
 
 def canonical_movie_title(value):
     text = clean_text(value).lower()
@@ -55,13 +49,11 @@ def canonical_movie_title(value):
     text = re.sub(r"[^a-z0-9\u0B80-\u0BFF\u0900-\u097F\s]", " ", text)
     return clean_text(text)
 
-
 def display_title(value):
     title = canonical_movie_title(value)
     if not title:
         return "Unknown title"
     return " ".join(word[:1].upper() + word[1:] for word in title.split())
-
 
 def parse_metadata(text):
     text = clean_text(text)
@@ -82,27 +74,24 @@ def parse_metadata(text):
     title = canonical_movie_title(text)
     return display_title(title), year, languages, quality
 
-
 def install(bot):
     bot.parse_metadata = parse_metadata
     bot.normalize_title = normalize_title
     bot.detect_languages = detect_languages
 
-
 async def migrate_existing_movies(bot):
-    """Rebuild titles and the complete language array from the original filename/caption."""
+    """Force a fresh language/title rebuild from every stored original filename."""
     marker = bot.db.movie_magic_meta
-    marker_id = "title_normalization_v7_multilanguage_filename_detection"
+    marker_id = "title_normalization_v8_multilanguage_filename_detection"
     if await marker.find_one({"_id": marker_id}):
-        bot.log.info("Movie title normalization v7 was already completed; skipping.")
+        bot.log.info("Movie title normalization v8 was already completed; skipping.")
         return 0
 
-    bot.log.info("Loading existing movie records for v7 language normalization...")
+    bot.log.info("Loading existing movie records for v8 language normalization...")
     cursor = bot.movies.find(
         {"enabled": True},
         {"_id": 1, "title": 1, "filename": 1, "year": 1, "language": 1, "languages": 1, "quality": 1},
     )
-
     total = 0
     updated = 0
     batch = []
@@ -117,15 +106,15 @@ async def migrate_existing_movies(bot):
         year = doc.get("year") or parsed_year
         if not parsed_languages:
             old = doc.get("languages") or []
-            if isinstance(old, str): old = [old]
+            if isinstance(old, str):
+                old = [old]
             parsed_languages = [x for x in old if x and str(x).lower() != "unknown"]
         parsed_languages = list(dict.fromkeys(parsed_languages)) or ["Unknown"]
         if year:
             known_years[normalize_title(parsed_title)][int(year)] += 1
         prepared.append((doc, parsed_title, year, parsed_languages, parsed_quality))
 
-    bot.log.info("v7 normalization found %s existing records.", total)
-
+    bot.log.info("v8 normalization found %s existing records.", total)
     processed = 0
     now = datetime.now(timezone.utc)
     for doc, title, year, languages, parsed_quality in prepared:
@@ -142,16 +131,15 @@ async def migrate_existing_movies(bot):
         }
         if year and doc.get("year") != year:
             update["year"] = int(year)
-        if (not doc.get("quality") or doc.get("quality") == "Unknown") and parsed_quality:
+        if parsed_quality:
             update["quality"] = parsed_quality
-        if any(doc.get(k) != v for k, v in update.items() if k not in ("title_normalized_at", "language_normalized_at")):
-            batch.append(UpdateOne({"_id": doc["_id"]}, {"$set": update}))
+        batch.append(UpdateOne({"_id": doc["_id"]}, {"$set": update}))
         processed += 1
         if len(batch) >= batch_size:
             result = await bot.movies.bulk_write(batch, ordered=False)
             updated += result.modified_count
             batch = []
-            bot.log.info("v7 normalization progress: %s/%s processed; %s updated.", processed, total, updated)
+            bot.log.info("v8 normalization progress: %s/%s processed; %s updated.", processed, total, updated)
 
     if batch:
         result = await bot.movies.bulk_write(batch, ordered=False)
@@ -162,5 +150,5 @@ async def migrate_existing_movies(bot):
         {"$set": {"completed_at": now, "scanned": total, "updated": updated}},
         upsert=True,
     )
-    bot.log.info("Movie title/language normalization v7 complete; scanned %s, updated %s records.", total, updated)
+    bot.log.info("Movie title/language normalization v8 complete; scanned %s, updated %s records.", total, updated)
     return updated
