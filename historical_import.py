@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-from bot import index_message, STORAGE_CHANNEL_ID, API_ID, API_HASH, movies
+from bot_v2 import index_message, STORAGE_CHANNEL_ID, API_ID, API_HASH, movies
 
 log = logging.getLogger("movie-importer")
 
@@ -13,9 +13,8 @@ log = logging.getLogger("movie-importer")
 async def import_history(limit=None, progress_callback=None):
     """Import historical media metadata from the configured channel.
 
-    This requires a Telethon USER_SESSION_STRING belonging to an account that
-    is authorized to access the storage channel. It stores metadata/message IDs
-    only; media is not downloaded.
+    Requires USER_SESSION_STRING for an authorized Telegram user account.
+    Media is not downloaded; only metadata and source message IDs are stored.
     """
     session = os.getenv("USER_SESSION_STRING", "").strip()
     if not session:
@@ -31,8 +30,6 @@ async def import_history(limit=None, progress_callback=None):
         async for message in user.iter_messages(STORAGE_CHANNEL_ID, limit=limit):
             scanned += 1
             if message.media and message.file:
-                # index_message only reads Telegram message metadata and writes
-                # the source message ID/channel ID to MongoDB.
                 await index_message(message)
                 imported += 1
 
