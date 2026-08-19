@@ -1,16 +1,10 @@
 import asyncio
 import os
-import threading
 
 from telethon.errors import FloodWaitError
 
-from health_server import run_health_server
-
-# Start Koyeb's HTTP health endpoint exactly once, before Telegram/MongoDB work.
-threading.Thread(target=run_health_server, daemon=True, name="health-server").start()
-print("Health server started early", flush=True)
-
 import bot_v2
+import file_to_link
 import normalization_patch
 
 # The patch provides the verified metadata parser (title/year/languages/quality)
@@ -77,6 +71,13 @@ async def run_maintenance():
 
 
 async def start_telegram_bot():
+    # Public web server FIRST, on this event loop: Koyeb health checks
+    # (/health), shortlink verification (/verify/<token>) and the file-to-link
+    # endpoints (/dl/<token>, /stream/<token>, /watch/<token>) must answer even
+    # while Telegram is still connecting or rate-limited.
+    await file_to_link.start_web_server(bot_v2)
+    print("Web server started early (health + verify + download + watch)", flush=True)
+
     # Do not replace/monkey-patch TelegramClient.start(). Telethon's start()
     # is already awaitable when called from an async event loop. A previous
     # wrapper caused startup/authentication to become unreliable.

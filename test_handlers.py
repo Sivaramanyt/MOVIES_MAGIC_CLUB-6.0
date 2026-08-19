@@ -16,6 +16,7 @@ from datetime import timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import bot_v2
+import file_to_link
 import normalization_patch
 import verification
 
@@ -24,6 +25,7 @@ normalization_patch.install(bot_v2)
 ADMIN_ID = 1
 USER_ID = 1001
 MOVIE_OID = "0123456789abcdef01234567"
+FILE_BYTES = bytes(range(256)) * 4096  # 1 MiB of deterministic pseudo file data
 
 
 # ---------------------------------------------------------------- fakes ----
@@ -117,6 +119,17 @@ class FakeCol:
         d = self.docs.get(q.get("_id", q.get("token")))
         return dict(d) if d else None
 
+    async def find_one_and_update(self, q, u):
+        d = self.docs.get(q.get("_id", q.get("token")))
+        if d is None:
+            return None
+        if q.get("used") == {"$ne": True} and d.get("used") is True:
+            return None  # filter {"used": {"$ne": True}} no longer matches
+        before = dict(d)
+        for k, v in u.get("$set", {}).items():
+            d[k] = v
+        return before
+
     async def insert_one(self, doc):
         self.docs[self._key(doc)] = dict(doc)
 
@@ -146,20 +159,50 @@ class FakeDB:
         self.settings = FakeCol()
         self.verifications = FakeCol()
         self.verify_tokens = FakeCol()
+        self.file_links = FakeCol()
+
+
+class FakeTGFile:
+    def __init__(self, name="LEO (2023) Tamil 1080p.mkv", size=None, mime="video/x-matroska"):
+        self.name = name
+        self.size = len(FILE_BYTES) if size is None else size
+        self.mime_type = mime
+
+
+class FakeTGMessage:
+    def __init__(self, **file_kwargs):
+        self.media = object()  # opaque handle, like a real MessageMediaDocument
+        self.file = FakeTGFile(**file_kwargs)
 
 
 class FakeClient:
-    def __init__(self):
-        self.forwarded = []
+    """Mirrors the Telethon client API used by bot_v2 delivery + file_to_link."""
 
-    async def forward_messages(self, *a, **k):
-        self.forwarded.append((a, k))
+    def __init__(self, **file_kwargs):
+        self.msg = FakeTGMessage(**file_kwargs)
+        self.sent_files = []
+
+    async def get_messages(self, chat, ids=None):
+        return self.msg
+
+    async def send_file(self, entity, file, caption=None, buttons=None, parse_mode=None):
+        self.sent_files.append({"entity": entity, "file": file, "caption": caption, "buttons": buttons})
+        return types.SimpleNamespace()
+
+    def iter_download(self, media, offset=0, chunk_size=None, **_ignored):
+        # async generator, mirroring telethon.iter_download (call it -> async gen)
+        data = FILE_BYTES[offset:]
+        step = chunk_size or 256 * 1024
+        async def gen():
+            for i in range(0, len(data), step):
+                yield data[i:i + step]
+        return gen()
 
 
-def install_fakes(movie_docs):
+def install_fakes(movie_docs, **file_kwargs):
     bot_v2.movies = FakeMovies(movie_docs)
     bot_v2.db = FakeDB()
-    bot_v2.client = FakeClient()
+    bot_v2.client = FakeClient(**file_kwargs)
     return bot_v2.db
 
 
@@ -217,7 +260,7 @@ def test_gate_blocks_normal_user_and_allows_after_reset():
     assert ev.edits, "gate must edit the message"
     gate_text = ev.edits[0][0]
     assert "free limit is over" in gate_text.lower(), gate_text
-    assert not bot_v2.client.forwarded, "no files may be sent when gated"
+    assert not bot_v2.client.sent_files, "no files may be sent when gated"
     assert len(db.verify_tokens.docs) == 1, "a one-time token must be created"
     print("✅ normal user at limit -> gate shown, no file sent, token created")
 
@@ -225,7 +268,7 @@ def test_gate_blocks_normal_user_and_allows_after_reset():
     db.verifications.docs[USER_ID]["free_used"] = 0
     ev = FakeEvent(USER_ID, groups=(MOVIE_OID, "0", "0"))
     asyncio.run(bot_v2.choose_quality(ev))
-    assert bot_v2.client.forwarded, "file must be forwarded when allowed"
+    assert bot_v2.client.sent_files, "file must be delivered when allowed"
     assert db.verifications.docs[USER_ID]["free_used"] == 1
     assert "Sent" in ev.edits[-1][0]
     print("✅ after reset -> file delivered and counted per file")
@@ -254,8 +297,156 @@ def test_parser_part_numbers():
     print("✅ parser: Part001/CD tags stripped, screenshot filenames parse correctly")
 
 
+# ------------------------------------------------------- file-to-link ----
+def test_human_size():
+    assert file_to_link.human_size(0) == "0 B"
+    assert file_to_link.human_size(500) == "500 B"
+    assert file_to_link.human_size(2048) == "2.00 KB"
+    assert file_to_link.human_size(int(557.31 * 1024 * 1024)) == "557.31 MB"
+    assert file_to_link.human_size(int(2.5 * 1024**3)) == "2.50 GB"
+    print("✅ human_size formats like the example (557.31 MB)")
+
+
+def test_caption_format_matches_example():
+    caption = file_to_link.build_file_caption(
+        "Agent.Kim.Reactivated.S01E09.1080p.NF.WEB-DL.AAC2.0.H.265-DU.mkv",
+        int(557.31 * 1024 * 1024),
+        "https://test.koyeb.app/dl/6a7bb27c913c8281a20eca89",
+        "https://test.koyeb.app/watch/6a7bb27c913c8281a20eca89",
+        bot_username="DDxBypass_Bot",
+    )
+    expected = (
+        "‣ File Name : Agent.Kim.Reactivated.S01E09.1080p.NF.WEB-DL.AAC2.0.H.265-DU.mkv\n\n"
+        "‣ File Size : 557.31 MB\n\n"
+        "➙ Download : https://test.koyeb.app/dl/6a7bb27c913c8281a20eca89\n\n"
+        "➙ Watch Online : https://test.koyeb.app/watch/6a7bb27c913c8281a20eca89\n\n"
+        "💡 Tip :- Use IDM (For PC) or 1DM (For Mobile) To Download With Maximum Speed\n\n"
+        "CC : @DDxBypass_Bot"
+    )
+    assert caption == expected, repr(caption)
+    print("✅ caption matches the user's example format exactly")
+
+
+def test_parse_range_header():
+    size = 1000
+    assert file_to_link.parse_range_header("bytes=0-99", size) == (0, 99)
+    assert file_to_link.parse_range_header("bytes=100-", size) == (100, 999)
+    assert file_to_link.parse_range_header("bytes=-200", size) == (800, 999)
+    assert file_to_link.parse_range_header("bytes=0-99999", size) == (0, 999)  # clamped
+    assert file_to_link.parse_range_header("bytes=0-99,200-299", size) == (0, 99)  # first range only
+    for bad in ("bytes=999-100", "bytes=1000-", "bytes=-0", "items=0-9", "bytes=abc-"):
+        try:
+            file_to_link.parse_range_header(bad, size)
+            raise AssertionError(f"range {bad!r} must be rejected")
+        except ValueError:
+            pass
+    print("✅ Range header parsing (full / open / suffix / clamped / rejected)")
+
+
+def test_delivery_attaches_links():
+    db = install_fakes([leo_doc()])
+    os.environ["BASE_URL"] = "https://test.koyeb.app"
+    ev = FakeEvent(USER_ID, groups=(MOVIE_OID, "0", "0"))
+    asyncio.run(bot_v2.choose_quality(ev))
+    assert len(bot_v2.client.sent_files) == 1, "exactly one file must be delivered"
+    sent = bot_v2.client.sent_files[0]
+    caption = sent["caption"]
+    assert "‣ File Name : LEO (2023) Tamil 1080p.mkv" in caption
+    assert "‣ File Size : 1.00 MB" in caption
+    assert "➙ Download : https://test.koyeb.app/dl/" in caption
+    assert "➙ Watch Online : https://test.koyeb.app/watch/" in caption
+    assert "💡 Tip :- Use IDM (For PC) or 1DM (For Mobile) To Download With Maximum Speed" in caption
+    assert "CC : @MOVIES_MAGIC_CLUB_bot" in caption
+    # same token in both links, and the URL buttons carry the same links
+    dl_line = next(l for l in caption.splitlines() if "/dl/" in l)
+    watch_line = next(l for l in caption.splitlines() if "/watch/" in l)
+    token = dl_line.rsplit("/dl/", 1)[1]
+    assert watch_line.endswith(f"/watch/{token}")
+    buttons = sent["buttons"][0]
+    assert [b.url for b in buttons] == [f"https://test.koyeb.app/dl/{token}", f"https://test.koyeb.app/watch/{token}"]
+    # token persisted with a 48h expiry
+    assert len(db.file_links.docs) == 1
+    link = db.file_links.docs[token]
+    assert link["message_id"] == 9001 and link["channel_id"] == -1001
+    assert link["expires_at"] > link["created_at"]
+    print("✅ delivery: caption + buttons carry /dl and /watch links, token stored with expiry")
+
+
+def test_web_server_endpoints():
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def main():
+        db = install_fakes([], name="LEO (2023) Tamil 1080p.mkv")
+        now = file_to_link.utcnow()
+        await db.file_links.insert_one({
+            "token": "goodtoken", "channel_id": -1001, "message_id": 9001,
+            "filename": "LEO (2023) Tamil 1080p.mkv", "size": len(FILE_BYTES),
+            "mime": "video/x-matroska", "created_at": now,
+            "expires_at": now + timedelta(hours=48),
+        })
+        await db.file_links.insert_one({
+            "token": "oldtoken", "channel_id": -1001, "message_id": 9001,
+            "filename": "old.mkv", "size": 10, "mime": "video/x-matroska",
+            "created_at": now - timedelta(hours=49), "expires_at": now - timedelta(hours=1),
+        })
+        app = file_to_link.create_app(bot_v2)
+        async with TestClient(TestServer(app)) as client:
+            r = await client.get("/health")
+            assert r.status == 200 and await r.text() == "OK"
+
+            r = await client.get("/dl/goodtoken")
+            assert r.status == 200, r.status
+            assert r.headers["Content-Length"] == str(len(FILE_BYTES))
+            assert r.headers["Accept-Ranges"] == "bytes"
+            assert "attachment" in r.headers["Content-Disposition"]
+            assert await r.read() == FILE_BYTES
+
+            r = await client.get("/dl/goodtoken", headers={"Range": "bytes=100-199"})
+            assert r.status == 206, r.status
+            assert r.headers["Content-Range"] == f"bytes 100-199/{len(FILE_BYTES)}"
+            assert await r.read() == FILE_BYTES[100:200]
+
+            r = await client.get("/stream/goodtoken", headers={"Range": "bytes=-300"})
+            assert r.status == 206 and "inline" in r.headers["Content-Disposition"]
+            assert await r.read() == FILE_BYTES[-300:]
+
+            r = await client.get("/dl/goodtoken", headers={"Range": "bytes=999999999-"})
+            assert r.status == 416
+
+            r = await client.get("/dl/nosuchtoken")
+            assert r.status == 404
+            r = await client.get("/dl/oldtoken")
+            assert r.status == 410  # expired
+
+            r = await client.get("/watch/goodtoken")
+            assert r.status == 200
+            html = await r.text()
+            assert "/stream/goodtoken" in html and "LEO (2023) Tamil 1080p.mkv" in html
+            assert "/dl/goodtoken" in html and "1.00 MB" in html
+
+            # shortlink verification callback (ported from the old health server)
+            await db.verify_tokens.insert_one({
+                "token": "vtok", "user_id": USER_ID, "created_at": now, "used": False,
+            })
+            r = await client.get("/verify/vtok")
+            assert r.status == 200 and "Verification successful" in await r.text()
+            assert db.verifications.docs[USER_ID]["verified_until"] > now
+            r = await client.get("/verify/vtok")
+            assert "invalid or was already used" in await r.text()
+            r = await client.get("/verify/unknown")
+            assert "invalid or was already used" in await r.text()
+
+    asyncio.run(main())
+    print("✅ web server: /health, /dl (200+206+416+404+410), /stream, /watch, /verify all pass")
+
+
 if __name__ == "__main__":
     test_verify_commands_no_nameerror()
     test_gate_blocks_normal_user_and_allows_after_reset()
     test_parser_part_numbers()
+    test_human_size()
+    test_caption_format_matches_example()
+    test_parse_range_header()
+    test_delivery_attaches_links()
+    test_web_server_endpoints()
     print("\nALL HANDLER SMOKE TESTS PASSED")

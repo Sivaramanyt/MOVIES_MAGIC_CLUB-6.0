@@ -11,6 +11,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import Button, TelegramClient, events
 from telethon.errors import MessageIdInvalidError
 
+import file_to_link
 import verification
 
 load_dotenv()
@@ -519,7 +520,9 @@ async def choose_quality(event):
     sent = 0
     for doc in docs:
         try:
-            await client.forward_messages(event.sender_id, doc["message_id"], from_peer=STORAGE_CHANNEL_ID, drop_author=True)
+            # File-to-link delivery: file + caption/buttons with fast download
+            # (/dl/<token>) and watch online (/watch/<token>) links.
+            await file_to_link.deliver_file(sys.modules[__name__], event.sender_id, doc)
             sent += 1
         except (MessageIdInvalidError, ValueError):
             log.warning("Stored channel message %s is unavailable", doc.get("message_id"))
