@@ -1,4 +1,5 @@
 import asyncio
+import os
 import threading
 
 from telethon.errors import FloodWaitError
@@ -24,6 +25,36 @@ normalization_patch.install(bot_v2)
 # messages via the admin /repair command (see repair.py).
 
 
+async def auto_repair_broken_records():
+    """One-shot metadata repair for OLD records, run automatically after startup.
+
+    Why: deploying new code never changes existing MongoDB records. Old records
+    with Unknown language/title must be rebuilt from the actual storage-channel
+    messages (the source of truth) exactly once. After that, broken count stays
+    at ~0 and this becomes a fast no-op on every later deploy.
+    Safe: targeted (broken records only), in-place, idempotent, non-blocking.
+    """
+    try:
+        from repair import count_broken, repair_from_source
+        broken = await count_broken(bot_v2)
+        if not broken:
+            bot_v2.log.info("Auto-repair: no broken records found; nothing to do.")
+            return
+        if not os.getenv("USER_SESSION_STRING", "").strip():
+            bot_v2.log.warning(
+                "Auto-repair: %s broken records need rebuilding, but USER_SESSION_STRING is not set. "
+                "Set it on Koyeb, then run /repair.", broken,
+            )
+            return
+        bot_v2.log.info("Auto-repair: rebuilding metadata for %s broken records from the storage channel...", broken)
+        async def progress(processed, updated):
+            bot_v2.log.info("Auto-repair progress: processed=%s updated=%s", processed, updated)
+        stats = await repair_from_source(bot_v2, full=False, progress=progress)
+        bot_v2.log.info("Auto-repair complete: %s", stats)
+    except Exception:
+        bot_v2.log.exception("Auto-repair failed")
+
+
 async def start_telegram_bot():
     # Do not replace/monkey-patch TelegramClient.start(). Telethon's start()
     # is already awaitable when called from an async event loop. A previous
@@ -47,6 +78,9 @@ async def start_telegram_bot():
     await bot_v2.ensure_indexes()
     bot_v2.log.info("Automatic channel indexing is enabled. Waiting for new storage-channel posts...")
     bot_v2.log.info("Metadata repair is available via the admin /repair command (no auto-migration runs at startup).")
+
+    # Rebuild old broken records from the channel automatically, in the background.
+    asyncio.create_task(auto_repair_broken_records())
 
     await bot_v2.client.run_until_disconnected()
 

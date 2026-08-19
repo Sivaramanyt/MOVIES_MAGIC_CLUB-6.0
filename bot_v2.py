@@ -182,7 +182,9 @@ async def check_command(event):
     This is the source-of-truth inspection for debugging metadata problems —
     no guessing about what the database contains.
     """
-    if event.sender_id not in ADMIN_IDS: return
+    if event.sender_id not in ADMIN_IDS:
+        await event.respond("⛔ Admin-only command. Add your Telegram user ID to `ADMIN_IDS` on Koyeb, redeploy, and try again.")
+        return
     query = clean_text(event.pattern_match.group(1) or "")
     if not query:
         await event.respond("Usage: `/check <movie name>` — shows the real stored records."); return
@@ -215,7 +217,9 @@ async def repair_command(event):
     `/repair all` re-reads the whole channel. Nothing is deleted; records are
     updated in place, keyed by (channel_id, message_id) — no duplicates.
     """
-    if event.sender_id not in ADMIN_IDS: return
+    if event.sender_id not in ADMIN_IDS:
+        await event.respond("⛔ Admin-only command. Add your Telegram user ID to `ADMIN_IDS` on Koyeb, redeploy, and try again.")
+        return
     if import_lock.locked():
         await event.respond("⏳ Another import/repair is already running. Wait for it to finish."); return
     full = bool(event.pattern_match.group(1))
@@ -244,7 +248,9 @@ async def repair_command(event):
 
 @client.on(events.NewMessage(pattern=r"^/stats$"))
 async def stats_command(event):
-    if event.sender_id not in ADMIN_IDS: return
+    if event.sender_id not in ADMIN_IDS:
+        await event.respond("⛔ Admin-only command. Add your Telegram user ID to `ADMIN_IDS` on Koyeb, redeploy, and try again.")
+        return
     total = await movies.count_documents({"enabled": True})
     groups = await movies.aggregate([{"$match": {"enabled": True}}, {"$group": {"_id": {"t": "$title_normalized", "y": "$year"}}}]).to_list(length=500000)
     language_counts = {}
