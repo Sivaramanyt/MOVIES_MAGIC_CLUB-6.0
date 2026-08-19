@@ -11,6 +11,8 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import Button, TelegramClient, events
 from telethon.errors import MessageIdInvalidError
 
+import verification
+
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("movie-bot")

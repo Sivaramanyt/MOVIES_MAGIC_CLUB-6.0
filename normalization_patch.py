@@ -84,6 +84,7 @@ def canonical_movie_title(value):
     text = re.sub(r"\b(?:2160p|1080p|720p|480p|360p|4k|uhd|fhd|hd)\b", " ", text, flags=re.I)
     text = re.sub(r"\b\d+(?:\.\d+)?\s*(?:gb|gib|mb|mib)\b", " ", text, flags=re.I)
     text = re.sub(r"\b\d+(?:\.\d+)?\s*(?:kbps|mbps|bps)\b", " ", text, flags=re.I)  # audio bitrates (640kbps etc.)
+    text = re.sub(r"\b(?:part|pt|cd|vol|disc|disk)\s*\d{1,3}\b", " ", text, flags=re.I)  # multi-part tags (Part001, CD2...)
     text = re.sub(r"\b(?:" + "|".join(re.escape(x) for x in LANGUAGES) + r")\b", " ", text, flags=re.I)
     text = re.sub(r"\b(?:" + "|".join(re.escape(x) for x in NOISE_WORDS) + r")\b", " ", text, flags=re.I)
     text = re.sub(r"\bx\d+\b", " ", text, flags=re.I)
