@@ -19,7 +19,16 @@ async def safe_start(self, *args, **kwargs):
 TelegramClient.start = safe_start
 
 import bot_v2
+import normalization_patch
+
+normalization_patch.install(bot_v2)
+
+
+async def main():
+    updated = await normalization_patch.migrate_existing_movies(bot_v2)
+    print(f"Movie title normalization complete; updated {updated} existing records.", flush=True)
+    await bot_v2.main()
 
 
 if __name__ == "__main__":
-    asyncio.run(bot_v2.main())
+    asyncio.run(main())
