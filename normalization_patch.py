@@ -1,6 +1,7 @@
 import re
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+from pymongo import UpdateOne
 
 NOISE_WORDS = (
     "www", "tamilmv", "tamilblasters", "1tamilblasters", "tamilrockers", "isaimini",
@@ -83,12 +84,14 @@ def install(bot):
 
 
 async def migrate_existing_movies(bot):
-    """Rebuild titles and language arrays for all existing indexed files."""
+    """Rebuild titles/languages for existing records using batched MongoDB writes."""
     marker = bot.db.movie_magic_meta
     marker_id = "title_normalization_v6_multilanguage_variants"
     if await marker.find_one({"_id": marker_id}):
+        bot.log.info("Movie title normalization v6 was already completed; skipping.")
         return 0
 
+    bot.log.info("Loading existing movie records for v6 normalization...")
     docs = []
     cursor = bot.movies.find(
         {"enabled": True},
@@ -96,6 +99,9 @@ async def migrate_existing_movies(bot):
     )
     async for doc in cursor:
         docs.append(doc)
+
+    total = len(docs)
+    bot.log.info("v6 normalization found %s existing records.", total)
 
     known_years = defaultdict(Counter)
     prepared = []
@@ -118,6 +124,19 @@ async def migrate_existing_movies(bot):
 
     updated = 0
     now = datetime.now(timezone.utc)
+    batch = []
+    batch_size = 250
+
+    async def flush_batch():
+        nonlocal updated, batch
+        if not batch:
+            return
+        result = await bot.movies.bulk_write(batch, ordered=False)
+        updated += result.modified_count
+        batch = []
+        bot.log.info("v6 normalization progress: %s/%s records processed; %s updated.", processed, total, updated)
+
+    processed = 0
     for doc, title, year, languages, parsed_quality in prepared:
         key = normalize_title(title)
         if not year and key in known_years and len(known_years[key]) == 1:
@@ -136,12 +155,17 @@ async def migrate_existing_movies(bot):
             update["quality"] = parsed_quality
 
         if any(doc.get(k) != v for k, v in update.items() if k != "title_normalized_at"):
-            await bot.movies.update_one({"_id": doc["_id"]}, {"$set": update})
-            updated += 1
+            batch.append(UpdateOne({"_id": doc["_id"]}, {"$set": update}))
+        processed += 1
+        if len(batch) >= batch_size:
+            await flush_batch()
+
+    await flush_batch()
 
     await marker.update_one(
         {"_id": marker_id},
-        {"$set": {"completed_at": now, "scanned": len(docs), "updated": updated}},
+        {"$set": {"completed_at": now, "scanned": total, "updated": updated}},
         upsert=True,
     )
+    bot.log.info("Movie title normalization complete; scanned %s, updated %s existing records.", total, updated)
     return updated
