@@ -78,6 +78,44 @@ Admins can also use `/add` to add an existing channel message manually:
 
 The message must already exist in the configured storage channel.
 
+## Shortlink verification (monetization)
+
+Free tier: every user gets **3 free file deliveries per day** (resets at midnight IST).
+The 4th delivery shows a verification gate instead: the user completes one
+shortlink and gets **unlimited files for 24 hours**. When the window expires,
+the user returns to the free tier with a fresh 3-file allowance.
+
+Flow:
+
+1. User hits the daily limit → bot shows a **Verify & Get Unlimited** button.
+2. The button is your monetized shortlink wrapping
+   `BASE_URL/verify/<one-time-token>`.
+3. The user finishes the shortlink → lands on `/verify/<token>` (served by the
+   built-in HTTP server alongside the Koyeb health endpoint) → success page.
+4. Back in Telegram the user taps the quality again → files are delivered.
+
+Setup (env vars):
+
+- `SHORTLINK_API` / `SHORTLINK_URL` — your shortlink service credentials
+  (arolinks/gplinks/shrinkme style `GET <service>/api?api=KEY&url=...`; several
+  response formats are tried automatically). If unset, the raw verification
+  link is used (no monetization).
+- `BASE_URL` — public URL of the app. On Koyeb this falls back to the
+  automatic `KOYEB_PUBLIC_DOMAIN`, so usually nothing to set.
+- `FREE_LIMIT` (default 3), `VERIFY_VALID_HOURS` (default 24),
+  `VERIFICATION_ENABLED` (default true), `BOT_USERNAME`.
+
+Admin commands (runtime, stored in Mongo — no redeploy needed):
+
+- `/verifyon` / `/verifyoff` — enable/disable the gate
+- `/verifylimit N` — free files per day per user
+- `/verifyhours N` — unlimited window length after verifying
+- `/verifystatus` — current settings, tracked users, verified users
+
+Admins (ADMIN_IDS) always bypass the gate. Verification state lives in the
+`verifications` and `verify_tokens` MongoDB collections; tokens are one-time
+and expire after `VERIFY_TOKEN_HOURS` (default 24).
+
 ## Running
 
 ```bash

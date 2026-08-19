@@ -212,8 +212,13 @@ async def get_group_file_count(base):
 async def get_language_docs(base, language):
     return await movies.find({"enabled": True, "title_normalized": base["title_normalized"], "year": base.get("year"), "$or": [{"languages": language}, {"language": language}]}).to_list(length=GROUP_DOC_LIMIT)
 
-@client.on(events.NewMessage(pattern=r"^/start$"))
+@client.on(events.NewMessage(pattern=r"^/start(?:\s+(\S+))?$"))
 async def start(event):
+    payload = event.pattern_match.group(1)
+    if payload:
+        # deep link back from the verification success page (or any /start payload)
+        await event.respond(await verification.status_text(sys.modules[__name__], event.sender_id))
+        return
     await event.respond("🎬 **Movie Magic Club**\n\nSend a movie name here or in the movie group.\n\nI will show the matching movie/year first, then language → quality → file.")
 
 @client.on(events.NewMessage(pattern=r"^/cancel$"))
@@ -332,6 +337,60 @@ async def stats_command(event):
     ]
     await event.respond("\n".join(lines))
 
+def _admin_only(event):
+    return event.sender_id in ADMIN_IDS
+
+async def _reject_non_admin(event):
+    await event.respond("⛔ Admin-only command. Add your Telegram user ID to `ADMIN_IDS` on Koyeb, redeploy, and try again.")
+
+@client.on(events.NewMessage(pattern=r"^/verifyon$"))
+async def verify_on(event):
+    if not _admin_only(event): await _reject_non_admin(event); return
+    await verification.set_setting(sys.modules[__name__], "enabled", True)
+    await event.respond("✅ Shortlink verification is now **ON**.")
+
+@client.on(events.NewMessage(pattern=r"^/verifyoff$"))
+async def verify_off(event):
+    if not _admin_only(event): await _reject_non_admin(event); return
+    await verification.set_setting(sys.modules[__name__], "enabled", False)
+    await event.respond("⏸ Shortlink verification is now **OFF** — all users get unlimited files.")
+
+@client.on(events.NewMessage(pattern=r"^/verifylimit\s+(\d+)$"))
+async def verify_limit(event):
+    if not _admin_only(event): await _reject_non_admin(event); return
+    limit = int(event.pattern_match.group(1))
+    await verification.set_setting(sys.modules[__name__], "free_limit", limit)
+    await event.respond(f"✅ Free daily limit set to **{limit}** files per user.")
+
+@client.on(events.NewMessage(pattern=r"^/verifyhours\s+(\d+)$"))
+async def verify_hours(event):
+    if not _admin_only(event): await _reject_non_admin(event); return
+    hours = int(event.pattern_match.group(1))
+    await verification.set_setting(sys.modules[__name__], "valid_hours", hours)
+    await event.respond(f"✅ Verification validity set to **{hours}** hours of unlimited access.")
+
+@client.on(events.NewMessage(pattern=r"^/verifystatus$"))
+async def verify_status(event):
+    if not _admin_only(event): await _reject_non_admin(event); return
+    bot = sys.modules[__name__]
+    settings = await verification.get_settings(bot)
+    now = verification.utcnow()
+    total_users = await db.verifications.count_documents({})
+    verified_now = await db.verifications.count_documents({"verified_until": {"$gt": now}})
+    base_url = verification.public_base_url() or "(not set — gate will fail open!)"
+    shortlink = "configured" if settings["shortlink_api"] and settings["shortlink_url"] else "NOT configured (raw links will be used)"
+    await event.respond(
+        "🔐 **Verification settings**\n\n"
+        f"Enabled: **{'ON' if settings['enabled'] else 'OFF'}**\n"
+        f"Free daily limit: **{settings['free_limit']}** files\n"
+        f"Verified window: **{settings['valid_hours']}** hours\n"
+        f"Shortlink API: **{shortlink}**\n"
+        f"Public base URL: `{base_url}`\n\n"
+        f"👥 Users tracked: **{total_users}**\n"
+        f"✅ Currently verified: **{verified_now}**\n\n"
+        "Commands: /verifyon /verifyoff /verifylimit N /verifyhours N /verifystatus"
+    )
+
 @client.on(events.NewMessage)
 async def movie_search(event):
     if event.raw_text.startswith("/") or not (event.is_private or event.is_group): return
@@ -391,6 +450,26 @@ async def choose_quality(event):
     docs = await movies.find(file_filter).sort("message_id", 1).limit(10).to_list(length=10)
     total_matching = await movies.count_documents(file_filter)
     if not docs: await event.answer("That version is no longer available.", alert=True); return
+
+    # Shortlink verification gate: FREE_LIMIT free deliveries, then verify for unlimited.
+    if event.sender_id not in ADMIN_IDS:
+        allowed, gate = await verification.check_access(sys.modules[__name__], event.sender_id)
+        if not allowed:
+            buttons = [
+                [Button.url("✅ Verify & Get Unlimited", gate["link"])],
+                [Button.inline("« Back to languages", data=f"movie:{movie_id}")],
+            ]
+            await event.edit(
+                "🚫 **Today's free limit is over!**\n\n"
+                f"You have already used your **{gate['free_limit']} free files** for today.\n\n"
+                f"✅ Complete one quick verification and get **UNLIMITED movies for {gate['valid_hours']} hours**:\n"
+                "👉 Tap **Verify & Get Unlimited** below, finish the short link, then come back and tap your quality again.\n\n"
+                "⏳ Or just wait — your free limit resets automatically.",
+                buttons=buttons,
+            )
+            await event.answer()
+            return
+
     await event.edit(f"📤 **Preparing your file{'s' if len(docs) != 1 else ''}...**\nPlease wait.")
     sent = 0
     for doc in docs:
@@ -401,6 +480,8 @@ async def choose_quality(event):
             log.warning("Stored channel message %s is unavailable", doc.get("message_id"))
         except Exception:
             log.exception("Unexpected send error for message %s", doc.get("message_id"))
+    if sent and event.sender_id not in ADMIN_IDS:
+        await verification.record_delivery(sys.modules[__name__], event.sender_id)
     year = base.get("year") or "Year unknown"
     nav = [[Button.inline("« Qualities", data=f"lang:{movie_id}:{lang_index}"), Button.inline("« Languages", data=f"movie:{movie_id}")]]
     if sent:
