@@ -18,8 +18,8 @@ async def safe_start(self, *args, **kwargs):
 
 TelegramClient.start = safe_start
 
-import bot
+import bot_v2
 
 
 if __name__ == "__main__":
-    asyncio.run(bot.main())
+    asyncio.run(bot_v2.main())
