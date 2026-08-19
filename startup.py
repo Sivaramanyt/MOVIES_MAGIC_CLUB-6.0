@@ -1,7 +1,15 @@
 import asyncio
+import threading
 
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
+
+from health_server import run_health_server
+
+# Start Koyeb's HTTP health endpoint immediately, before imports,
+# MongoDB migration, or Telegram authentication can block startup.
+threading.Thread(target=run_health_server, daemon=True).start()
+print("Health server started early", flush=True)
 
 _original_start = TelegramClient.start
 
@@ -12,7 +20,10 @@ async def safe_start(self, *args, **kwargs):
             return await _original_start(self, *args, **kwargs)
         except FloodWaitError as exc:
             wait_seconds = int(exc.seconds) + 5
-            print(f"Telegram authorization is rate-limited; waiting {wait_seconds} seconds before retrying.", flush=True)
+            print(
+                f"Telegram authorization is rate-limited; waiting {wait_seconds} seconds before retrying.",
+                flush=True,
+            )
             await asyncio.sleep(wait_seconds)
 
 
