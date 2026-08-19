@@ -34,7 +34,8 @@ import normalization_patch
 normalization_patch.install(bot_v2)
 
 
-async def background_normalization():
+async def normalize_before_bot():
+    print("Starting movie title normalization...", flush=True)
     try:
         updated = await normalization_patch.migrate_existing_movies(bot_v2)
         print(
@@ -42,14 +43,16 @@ async def background_normalization():
             flush=True,
         )
     except Exception:
-        # Normalization must never prevent the Telegram bot from starting.
-        bot_v2.log.exception("Background movie title normalization failed")
+        bot_v2.log.exception("Movie title normalization failed")
+        raise
 
 
 async def main():
-    # Start the bot first. The one-time MongoDB migration runs in the background
-    # so a large collection cannot make Telegram appear offline.
-    asyncio.create_task(background_normalization())
+    # The health endpoint is already live, so Koyeb remains healthy while the
+    # one-time MongoDB cleanup runs. Starting Telegram after the cleanup makes
+    # the search UI deterministic: old release filenames cannot leak into the
+    # first search result.
+    await normalize_before_bot()
     print("Starting Telegram bot...", flush=True)
     await bot_v2.main()
 
