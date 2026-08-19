@@ -12,19 +12,16 @@ print("Health server started early", flush=True)
 import bot_v2
 import normalization_patch
 
+# The patch provides the verified metadata parser (title/year/languages/quality)
+# used for every newly indexed storage-channel post.
 normalization_patch.install(bot_v2)
 
-
-async def background_normalization():
-    print("Starting background movie title normalization...", flush=True)
-    try:
-        updated = await normalization_patch.migrate_existing_movies(bot_v2)
-        print(
-            f"Movie title normalization complete; updated {updated} existing records.",
-            flush=True,
-        )
-    except Exception:
-        bot_v2.log.exception("Background movie title normalization failed")
+# NOTE: The old blind filename-based auto-migration (v5-v8) is intentionally NOT
+# run at startup anymore. It re-parsed the stored "filename" field, which is
+# "Unknown"/junk for many old records (captions were never stored), so it could
+# never fix them and could even corrupt their titles. Metadata for existing
+# records is now rebuilt deterministically from the actual storage-channel
+# messages via the admin /repair command (see repair.py).
 
 
 async def start_telegram_bot():
@@ -49,9 +46,7 @@ async def start_telegram_bot():
     bot_v2.log.info("Bot started as @%s", me.username)
     await bot_v2.ensure_indexes()
     bot_v2.log.info("Automatic channel indexing is enabled. Waiting for new storage-channel posts...")
-
-    # MongoDB cleanup must never block Telegram updates.
-    asyncio.create_task(background_normalization())
+    bot_v2.log.info("Metadata repair is available via the admin /repair command (no auto-migration runs at startup).")
 
     await bot_v2.client.run_until_disconnected()
 

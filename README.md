@@ -34,9 +34,26 @@ Copy `.env.example` to `.env` and fill in:
 - `STORAGE_CHANNEL_ID`: channel ID where authorized media is stored
 - `ADMIN_IDS`: comma-separated Telegram user IDs allowed to run admin commands
 
+## Admin commands
+
+- `/check <movie name>` — show the **actual stored MongoDB records** for a movie
+  (title, year, languages, quality, filename, whether a caption is stored).
+  This is the source-of-truth diagnostic for metadata problems.
+- `/repair` — rebuild metadata for **broken records** (Unknown language/title)
+  by re-reading the actual storage-channel messages through the user session.
+  Nothing is deleted; records are updated in place, keyed by
+  `(channel_id, message_id)` — no duplicates.
+- `/repair all` — same, but re-reads **every** storage-channel message.
+- `/stats` — indexed files, unique movies, language/quality distribution,
+  and the number of broken records.
+
+`ADMIN_IDS` must contain your Telegram user ID for these to work, and
+`USER_SESSION_STRING` (an authorized Telegram user session) must be set for
+`/repair`, exactly like the historical importer.
+
 ## Cataloging media
 
-The bot automatically indexes **new posts** arriving in the configured storage channel when the post contains a supported media file and a parseable filename/caption.
+The bot automatically indexes **new posts** arriving in the configured storage channel when the post contains a supported media file and a parseable filename/caption. Metadata is mined from **both** the filename and the caption: languages are unioned (so `[Malayalam + Kannada]` files appear under both languages), and the caption is stored so metadata can always be re-parsed later.
 
 For reliable metadata, use a caption such as:
 

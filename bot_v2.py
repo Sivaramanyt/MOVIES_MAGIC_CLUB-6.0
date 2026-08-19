@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import sys
 from datetime import datetime, timezone
 
 from bson import ObjectId
@@ -26,8 +27,24 @@ mongo = AsyncIOMotorClient(MONGO_URI)
 db = mongo[MONGO_DB]
 movies = db.movies
 SEARCH_LIMIT = 40
+GROUP_DOC_LIMIT = 500  # docs read per movie/language when building buttons (must exceed max files per movie)
 LANGUAGES = ("Tamil", "Telugu", "Malayalam", "Kannada", "Hindi", "English", "Bengali", "Marathi")
 import_lock = asyncio.Lock()
+
+JUNK_WORDS = {
+    "video", "vid", "file", "document", "doc", "movie", "mp4", "mkv", "avi", "mov",
+    "media", "photo", "img", "image", "whatsapp", "telegram", "download", "screenshot",
+    "rec", "recording", "clip", "new", "final", "copy", "sample", "unknown", "wa",
+}
+# Upload/camera artifact tokens: pure numbers ("2024", "0002") or letter-prefix+numbers ("WA0002").
+JUNK_TOKEN_RE = re.compile(r"(?i)^(?:\d+|[a-z]{1,4}\d{3,}[a-z0-9]*)$")
+
+def is_junk_title(title: str) -> bool:
+    """True when a parsed title is clearly a camera/upload artifact, not a movie name."""
+    if not title or title in ("Unknown", "Unknown title"):
+        return True
+    tokens = title.split()
+    return all(t.lower() in JUNK_WORDS or JUNK_TOKEN_RE.match(t) for t in tokens)
 
 def clean_text(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
@@ -55,10 +72,28 @@ def parse_metadata(text: str):
     return clean_text(title) or text, year, languages, quality
 
 def metadata_from_message(message):
-    caption = message.raw_text or ""
+    caption = clean_text(message.raw_text or "")
     filename = message.file.name if message.file else None
     source = filename or caption or "Unknown"
     title, year, languages, quality = parse_metadata(source)
+    # ALWAYS mine the caption as well. Telegram filenames are often missing or
+    # junk ("video_2024-01-15.mp4") while the caption carries the real release
+    # name. Languages are UNIONED so multilingual releases ("[Malayalam +
+    # Kannada]") keep every language no matter where it was written.
+    if caption and caption != source:
+        caption_title, caption_year, caption_languages, caption_quality = parse_metadata(caption)
+        languages = list(dict.fromkeys(list(languages or []) + list(caption_languages or [])))
+        if is_junk_title(title) and not is_junk_title(caption_title):
+            # The filename was an upload artifact ("VID-20231101-WA0002.mp4"):
+            # trust the caption wholesale, including its year and quality.
+            title = caption_title
+            year = caption_year or year
+            quality = caption_quality or quality
+        else:
+            if not year:
+                year = caption_year
+            if not quality:
+                quality = caption_quality
     overrides = {"year": r"(?:year)\s*[:=-]\s*((?:19|20)\d{2})", "language": r"(?:language|lang)\s*[:=-]\s*([^\n|]+)", "quality": r"(?:quality)\s*[:=-]\s*([^\n|]+)"}
     for key, pattern in overrides.items():
         match = re.search(pattern, caption, re.I)
@@ -69,12 +104,13 @@ def metadata_from_message(message):
                 detected = [x for x in LANGUAGES if re.search(rf"\b{re.escape(x)}\b", value, re.I)]
                 languages = list(dict.fromkeys(languages + detected)) or [value]
             else: quality = value
-    return {"title": title, "title_normalized": normalize_title(title), "year": year, "languages": languages or ["Unknown"], "language": languages[0] if languages else "Unknown", "quality": quality or "Unknown", "channel_id": STORAGE_CHANNEL_ID, "message_id": message.id, "filename": filename or "Unknown", "created_at": datetime.now(timezone.utc), "enabled": True}
+    return {"title": title, "title_normalized": normalize_title(title), "year": year, "languages": languages or ["Unknown"], "language": languages[0] if languages else "Unknown", "quality": quality or "Unknown", "channel_id": STORAGE_CHANNEL_ID, "message_id": message.id, "filename": filename or "Unknown", "caption": caption[:500] if caption else None, "created_at": datetime.now(timezone.utc), "enabled": True}
 
 async def index_message(message):
     if not message.media or not message.file: return False
     data = metadata_from_message(message)
-    await movies.update_one({"channel_id": STORAGE_CHANNEL_ID, "message_id": message.id}, {"$set": data}, upsert=True)
+    created_at = data.pop("created_at")
+    await movies.update_one({"channel_id": STORAGE_CHANNEL_ID, "message_id": message.id}, {"$set": data, "$setOnInsert": {"created_at": created_at}}, upsert=True)
     log.info("Indexed message %s: %s | %s | %s | %s", message.id, data["title"], data["year"], ",".join(data["languages"]), data["quality"])
     return True
 
@@ -108,7 +144,7 @@ async def get_movie_group(movie_id: ObjectId):
     return await movies.find_one({"_id": movie_id, "enabled": True}, {"title": 1, "title_normalized": 1, "year": 1})
 
 async def get_group_languages(base):
-    docs = await movies.find({"enabled": True, "title_normalized": base["title_normalized"], "year": base.get("year")}, {"languages": 1, "language": 1}).to_list(length=SEARCH_LIMIT)
+    docs = await movies.find({"enabled": True, "title_normalized": base["title_normalized"], "year": base.get("year")}, {"languages": 1, "language": 1}).to_list(length=GROUP_DOC_LIMIT)
     found = set()
     for d in docs:
         vals = d.get("languages") or ([d.get("language")] if d.get("language") else [])
@@ -120,7 +156,7 @@ async def get_group_file_count(base):
     return await movies.count_documents({"enabled": True, "title_normalized": base["title_normalized"], "year": base.get("year")})
 
 async def get_language_docs(base, language):
-    return await movies.find({"enabled": True, "title_normalized": base["title_normalized"], "year": base.get("year"), "$or": [{"languages": language}, {"language": language}]}).to_list(length=SEARCH_LIMIT)
+    return await movies.find({"enabled": True, "title_normalized": base["title_normalized"], "year": base.get("year"), "$or": [{"languages": language}, {"language": language}]}).to_list(length=GROUP_DOC_LIMIT)
 
 @client.on(events.NewMessage(pattern=r"^/start$"))
 async def start(event):
@@ -128,6 +164,113 @@ async def start(event):
 
 @client.on(events.NewMessage(pattern=r"^/cancel$"))
 async def cancel(event): await event.respond("❌ Search cancelled. Send a movie name to search again.")
+
+async def send_chunked(event, header, lines):
+    buffer = header
+    for line in lines:
+        if len(buffer) + len(line) + 1 > 3800:
+            await event.respond(buffer)
+            buffer = ""
+        buffer += line + "\n"
+    if buffer.strip():
+        await event.respond(buffer)
+
+@client.on(events.NewMessage(pattern=r"^/check(?:\s+(.+))?$"))
+async def check_command(event):
+    """Admin diagnostic: show the ACTUAL stored MongoDB records for a movie.
+
+    This is the source-of-truth inspection for debugging metadata problems —
+    no guessing about what the database contains.
+    """
+    if event.sender_id not in ADMIN_IDS: return
+    query = clean_text(event.pattern_match.group(1) or "")
+    if not query:
+        await event.respond("Usage: `/check <movie name>` — shows the real stored records."); return
+    normalized = normalize_title(query)
+    pattern = ".*" + ".*".join(re.escape(w) for w in normalized.split()) + ".*"
+    docs = await movies.find({"enabled": True, "title_normalized": {"$regex": pattern}}).limit(25).to_list(length=25)
+    total = await movies.count_documents({"enabled": True, "title_normalized": {"$regex": pattern}})
+    from repair import count_broken
+    broken = await count_broken(sys.modules[__name__])
+    if not docs:
+        await event.respond(f"No records match `{query}`.")
+        if broken:
+            await event.respond(f"⚠️ There are **{broken}** broken records (Unknown language/title) that this search can never see.\nRun `/repair` to rebuild them from the storage channel.")
+        return
+    lines = []
+    for d in docs:
+        lines.append(
+            f"• msg `{d.get('message_id')}` | **{d.get('title')}** ({d.get('year')})\n"
+            f"  langs=`{d.get('languages')}` lang=`{d.get('language')}` quality=`{d.get('quality')}`\n"
+            f"  file=`{str(d.get('filename'))[:70]}` caption_stored=`{'yes' if d.get('caption') else 'no'}`"
+        )
+    footer = f"\nℹ️ Broken records invisible to this search: **{broken}**" if broken else ""
+    await send_chunked(event, f"🔍 **{total}** record(s) match `{query}` (showing up to 25):{footer}\n", lines)
+
+@client.on(events.NewMessage(pattern=r"^/repair(?:\s+(all))?$"))
+async def repair_command(event):
+    """Admin: rebuild metadata from the actual storage-channel messages.
+
+    Targeted mode (default) only rebuilds broken records (Unknown language/title).
+    `/repair all` re-reads the whole channel. Nothing is deleted; records are
+    updated in place, keyed by (channel_id, message_id) — no duplicates.
+    """
+    if event.sender_id not in ADMIN_IDS: return
+    if import_lock.locked():
+        await event.respond("⏳ Another import/repair is already running. Wait for it to finish."); return
+    full = bool(event.pattern_match.group(1))
+    mode = "FULL channel rescan" if full else "targeted repair of broken records"
+    await event.respond(
+        f"🛠 Starting **{mode}**...\n\n"
+        "Metadata is rebuilt from the actual storage-channel messages (filename + caption).\n"
+        "Nothing is deleted or re-imported from scratch — records are updated in place."
+    )
+    async def progress(processed, updated):
+        try: await event.respond(f"🛠 Repair progress: processed **{processed}**, updated **{updated}** records.")
+        except Exception: pass
+    async with import_lock:
+        try:
+            from repair import repair_from_source
+            stats = await repair_from_source(sys.modules[__name__], full=full, progress=progress)
+            await event.respond(
+                f"✅ **Repair complete.**\n\n"
+                f"Mode: {stats['mode']}\nTargets: {stats['targets']}\n"
+                f"Processed: **{stats['processed']}**\nUpdated: **{stats['updated']}**\n\n"
+                "Now try the movie search again."
+            )
+        except Exception as exc:
+            log.exception("Repair failed")
+            await event.respond(f"❌ Repair failed: `{type(exc).__name__}: {exc}`")
+
+@client.on(events.NewMessage(pattern=r"^/stats$"))
+async def stats_command(event):
+    if event.sender_id not in ADMIN_IDS: return
+    total = await movies.count_documents({"enabled": True})
+    groups = await movies.aggregate([{"$match": {"enabled": True}}, {"$group": {"_id": {"t": "$title_normalized", "y": "$year"}}}]).to_list(length=500000)
+    language_counts = {}
+    quality_counts = {}
+    async for d in movies.find({"enabled": True}, {"languages": 1, "language": 1, "quality": 1}):
+        langs = d.get("languages") or ([d.get("language")] if d.get("language") else [])
+        if isinstance(langs, str): langs = [langs]
+        for lang in langs:
+            if lang: language_counts[lang] = language_counts.get(lang, 0) + 1
+        quality = d.get("quality") or "Unknown"
+        quality_counts[quality] = quality_counts.get(quality, 0) + 1
+    top_languages = sorted(language_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:12]
+    top_qualities = sorted(quality_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:12]
+    from repair import count_broken
+    broken = await count_broken(sys.modules[__name__])
+    lines = [
+        "📊 **Bot statistics**\n",
+        f"📁 Indexed files (enabled): **{total}**",
+        f"🎬 Unique movies (title+year): **{len(groups)}**",
+        f"⚠️ Broken records (Unknown language/title): **{broken}**",
+        "\n🌐 Languages:",
+        *[f"  • {k}: {v}" for k, v in top_languages],
+        "\n📺 Qualities:",
+        *[f"  • {k}: {v}" for k, v in top_qualities],
+    ]
+    await event.respond("\n".join(lines))
 
 @client.on(events.NewMessage)
 async def movie_search(event):
@@ -166,7 +309,9 @@ async def choose_language(event):
     qualities = sorted({clean_text(d.get("quality") or "Unknown") for d in docs}, key=str.lower)
     if not qualities: await event.answer("No quality is available for this language.", alert=True); return
     buttons = [Button.inline(q[:50], data=f"quality:{movie_id}:{lang_index}:{i}") for i,q in enumerate(qualities)]
-    await event.edit(f"🎬 **{base['title']} ({base.get('year') or 'Year unknown'})**\n🌐 Language: **{language}**\n\n📺 **Select quality:**", buttons=[buttons[i:i+2] for i in range(0,len(buttons),2)])
+    rows = [buttons[i:i+2] for i in range(0,len(buttons),2)]
+    rows.append([Button.inline("« Back to languages", data=f"movie:{movie_id}")])
+    await event.edit(f"🎬 **{base['title']} ({base.get('year') or 'Year unknown'})**\n🌐 Language: **{language}**\n\n📺 **Select quality:**", buttons=rows)
     await event.answer()
 
 @client.on(events.CallbackQuery(pattern=rb"^quality:([0-9a-f]{24}):(\d+):(\d+)$"))
@@ -182,16 +327,27 @@ async def choose_quality(event):
     qualities = sorted({clean_text(d.get("quality") or "Unknown") for d in docs}, key=str.lower)
     if quality_index >= len(qualities): await event.answer("Quality option expired. Search again.", alert=True); return
     quality = qualities[quality_index]
-    doc = await movies.find_one({"enabled": True, "title_normalized": base["title_normalized"], "year": base.get("year"), "$or": [{"languages": language}, {"language": language}], "quality": quality})
-    if not doc: await event.answer("That version is no longer available.", alert=True); return
-    await event.edit("📤 **Preparing your file...**\nPlease wait.")
-    try:
-        await client.forward_messages(event.sender_id, doc["message_id"], from_peer=STORAGE_CHANNEL_ID, drop_author=True)
-        await event.edit(f"✅ **{base['title']} ({base.get('year') or 'Year unknown'})**\n🌐 {language} • 📺 {quality}\n\n📁 File sent above.")
-    except (MessageIdInvalidError, ValueError):
-        log.exception("Could not send stored media"); await event.edit("⚠️ I could not send that file. The stored channel message may be unavailable.")
-    except Exception:
-        log.exception("Unexpected send error"); await event.edit("⚠️ Something went wrong while sending the file. Please try again later.")
+    file_filter = {"enabled": True, "title_normalized": base["title_normalized"], "year": base.get("year"), "$or": [{"languages": language}, {"language": language}], "quality": quality}
+    docs = await movies.find(file_filter).sort("message_id", 1).limit(10).to_list(length=10)
+    total_matching = await movies.count_documents(file_filter)
+    if not docs: await event.answer("That version is no longer available.", alert=True); return
+    await event.edit(f"📤 **Preparing your file{'s' if len(docs) != 1 else ''}...**\nPlease wait.")
+    sent = 0
+    for doc in docs:
+        try:
+            await client.forward_messages(event.sender_id, doc["message_id"], from_peer=STORAGE_CHANNEL_ID, drop_author=True)
+            sent += 1
+        except (MessageIdInvalidError, ValueError):
+            log.warning("Stored channel message %s is unavailable", doc.get("message_id"))
+        except Exception:
+            log.exception("Unexpected send error for message %s", doc.get("message_id"))
+    year = base.get("year") or "Year unknown"
+    nav = [[Button.inline("« Qualities", data=f"lang:{movie_id}:{lang_index}"), Button.inline("« Languages", data=f"movie:{movie_id}")]]
+    if sent:
+        extra = f"\n(Showing first {len(docs)} of {total_matching} matching files.)" if total_matching > len(docs) else ""
+        await event.edit(f"✅ **{base['title']} ({year})**\n🌐 {language} • 📺 {quality}\n\n📁 Sent **{sent}** file{'s' if sent != 1 else ''} above.{extra}", buttons=nav)
+    else:
+        await event.edit("⚠️ I could not send those files. The stored channel messages may be unavailable.", buttons=nav)
     await event.answer()
 
 async def ensure_indexes():
