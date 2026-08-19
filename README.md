@@ -72,3 +72,4 @@ python bot.py
 ```
 
 The bot uses inline buttons and callback queries, so users do not need to type each selection manually.
+
