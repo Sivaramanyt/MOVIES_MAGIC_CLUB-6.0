@@ -8,6 +8,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py bot_v2.py health_server.py historical_import.py startup.py ./
+COPY bot.py bot_v2.py health_server.py historical_import.py startup.py normalization_patch.py ./
 
 CMD ["python", "startup.py"]
