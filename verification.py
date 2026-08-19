@@ -167,6 +167,10 @@ async def check_access(bot, user_id):
         state = await get_state(bot, user_id)
         if not is_blocked(settings, state):
             return True, None
+        log.info(
+            "Gate: blocking user %s (free_used=%s, limit=%s) — issuing verification link",
+            user_id, state.get("free_used", 0), settings["free_limit"],
+        )
         link = await build_verification_link(bot, user_id, settings)
         if not link:
             log.error("User %s hit the gate but no public BASE_URL is configured; failing open", user_id)
@@ -177,13 +181,15 @@ async def check_access(bot, user_id):
         return True, None
 
 
-async def record_delivery(bot, user_id):
-    """Count one delivered file batch against the daily free allowance."""
+async def record_delivery(bot, user_id, count=1):
+    """Count delivered FILES against the daily free allowance."""
+    if count <= 0:
+        return
     try:
         await get_state(bot, user_id)  # ensures doc exists and resets are applied
         await bot.db.verifications.update_one(
             {"_id": user_id},
-            {"$inc": {"free_used": 1}, "$set": {"updated_at": utcnow()}},
+            {"$inc": {"free_used": int(count)}, "$set": {"updated_at": utcnow()}},
         )
     except Exception:
         log.exception("Could not record delivery for user %s", user_id)

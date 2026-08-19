@@ -379,6 +379,7 @@ async def verify_status(event):
     verified_now = await db.verifications.count_documents({"verified_until": {"$gt": now}})
     base_url = verification.public_base_url() or "(not set — gate will fail open!)"
     shortlink = "configured" if settings["shortlink_api"] and settings["shortlink_url"] else "NOT configured (raw links will be used)"
+    state = await verification.get_state(bot, event.sender_id)
     await event.respond(
         "🔐 **Verification settings**\n\n"
         f"Enabled: **{'ON' if settings['enabled'] else 'OFF'}**\n"
@@ -387,9 +388,51 @@ async def verify_status(event):
         f"Shortlink API: **{shortlink}**\n"
         f"Public base URL: `{base_url}`\n\n"
         f"👥 Users tracked: **{total_users}**\n"
-        f"✅ Currently verified: **{verified_now}**\n\n"
-        "Commands: /verifyon /verifyoff /verifylimit N /verifyhours N /verifystatus"
+        f"✅ Currently verified: **{verified_now}**\n"
+        f"🙋 Your state: free_used=**{state.get('free_used', 0)}**, verified_until=`{state.get('verified_until') or '—'}`\n\n"
+        "⚠️ You are in ADMIN_IDS — **the gate never applies to you.** "
+        "Test with a normal account, or use /verifytest to simulate a normal user with your state.\n\n"
+        "Commands: /verifyon /verifyoff /verifylimit N /verifyhours N /verifystatus /verifytest /verifyreset"
     )
+
+@client.on(events.NewMessage(pattern=r"^/verifytest$"))
+async def verify_test(event):
+    """Admin: simulate the gate as a normal user with your own current state."""
+    if not _admin_only(event): await _reject_non_admin(event); return
+    bot = sys.modules[__name__]
+    settings = await verification.get_settings(bot)
+    state = await verification.get_state(bot, event.sender_id)
+    blocked = verification.is_blocked(settings, state)
+    used = int(state.get("free_used", 0))
+    vu = state.get("verified_until")
+    lines = [
+        "🧪 **Verification self-test** — what a NORMAL user would get with your current state:\n",
+        f"• Verification: **{'ON' if settings['enabled'] else 'OFF'}**",
+        f"• Free limit: **{settings['free_limit']}** files/day",
+        f"• Your free_used today: **{used}**",
+        f"• Your verified_until: `{vu or 'none'}`",
+        f"\n→ A normal user would be: **{'🚫 BLOCKED — gate shown' if blocked else '✅ ALLOWED — file sent'}**",
+    ]
+    if blocked:
+        link = await verification.build_verification_link(bot, event.sender_id, settings)
+        if link:
+            lines.append("\nGate preview (real link):")
+            await event.respond("\n".join(lines), buttons=[[Button.url("✅ Verify & Get Unlimited", link)]])
+            return
+        lines.append("\n⚠️ Could not build a verification link — BASE_URL/KOYEB_PUBLIC_DOMAIN missing!")
+    await event.respond("\n".join(lines))
+
+@client.on(events.NewMessage(pattern=r"^/verifyreset(?:\s+(\d+))?$"))
+async def verify_reset(event):
+    """Admin: reset a user's verification state (default: yourself)."""
+    if not _admin_only(event): await _reject_non_admin(event); return
+    target = int(event.pattern_match.group(1)) if event.pattern_match.group(1) else event.sender_id
+    await db.verifications.update_one(
+        {"_id": target},
+        {"$set": {"free_used": 0, "verified_until": None, "updated_at": verification.utcnow()}},
+        upsert=True,
+    )
+    await event.respond(f"♻️ Verification state reset for user `{target}` (0 files used, not verified).")
 
 @client.on(events.NewMessage)
 async def movie_search(event):
@@ -481,7 +524,7 @@ async def choose_quality(event):
         except Exception:
             log.exception("Unexpected send error for message %s", doc.get("message_id"))
     if sent and event.sender_id not in ADMIN_IDS:
-        await verification.record_delivery(sys.modules[__name__], event.sender_id)
+        await verification.record_delivery(sys.modules[__name__], event.sender_id, sent)
     year = base.get("year") or "Year unknown"
     nav = [[Button.inline("« Qualities", data=f"lang:{movie_id}:{lang_index}"), Button.inline("« Languages", data=f"movie:{movie_id}")]]
     if sent:
