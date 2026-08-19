@@ -6,8 +6,7 @@ from telethon.errors import FloodWaitError
 
 from health_server import run_health_server
 
-# Start Koyeb's HTTP health endpoint immediately, before imports,
-# MongoDB migration, or Telegram authentication can block startup.
+# Koyeb health endpoint must be available immediately.
 threading.Thread(target=run_health_server, daemon=True).start()
 print("Health server started early", flush=True)
 
@@ -35,9 +34,23 @@ import normalization_patch
 normalization_patch.install(bot_v2)
 
 
+async def background_normalization():
+    try:
+        updated = await normalization_patch.migrate_existing_movies(bot_v2)
+        print(
+            f"Movie title normalization complete; updated {updated} existing records.",
+            flush=True,
+        )
+    except Exception:
+        # Normalization must never prevent the Telegram bot from starting.
+        bot_v2.log.exception("Background movie title normalization failed")
+
+
 async def main():
-    updated = await normalization_patch.migrate_existing_movies(bot_v2)
-    print(f"Movie title normalization complete; updated {updated} existing records.", flush=True)
+    # Start the bot first. The one-time MongoDB migration runs in the background
+    # so a large collection cannot make Telegram appear offline.
+    asyncio.create_task(background_normalization())
+    print("Starting Telegram bot...", flush=True)
     await bot_v2.main()
 
 
