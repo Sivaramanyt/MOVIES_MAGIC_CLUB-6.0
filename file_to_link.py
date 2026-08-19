@@ -47,7 +47,11 @@ LINK_TTL = timedelta(hours=int(os.getenv("LINK_TTL_HOURS", "48")))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "MOVIES_MAGIC_CLUB_bot").lstrip("@")
 VERIFY_VALID_HOURS_DEFAULT = int(os.getenv("VERIFY_VALID_HOURS", "24"))
 TOKEN_TTL_HOURS = int(os.getenv("VERIFY_TOKEN_HOURS", "24"))
-CHUNK_SIZE = 256 * 1024  # 256KB per Telegram chunk (IDM-friendly)
+PART_SIZE = 512 * 1024  # max Telegram request size — fewest round trips
+# Parallel Telegram part requests per stream: hides DC round-trip latency
+# (sequential fetching caps throughput at ~PART_SIZE/RTT — very slow far from the DC).
+STREAM_WORKERS = int(os.getenv("LINK_STREAM_WORKERS", "4"))
+MAX_BUFFER_PARTS = STREAM_WORKERS  # bounded reassembly buffer (≤ STREAM_WORKERS × 512KB per connection)
 
 
 # ---------------------------------------------------------------- caption ----
@@ -324,18 +328,128 @@ async def _lookup_link(request):
     return link, None
 
 
+async def _fetch_part(client, media, offset, take):
+    """Download exactly `take` bytes starting at `offset` (one Telegram part)."""
+    request_size = min(PART_SIZE, max(4096, -(-take // 4096) * 4096))
+    buf = bytearray()
+    async for chunk in client.iter_download(media, offset=offset, chunk_size=request_size, request_size=request_size):
+        buf += chunk
+        if len(buf) >= take:
+            break
+    return bytes(buf[:take])
+
+
+async def _pump_range(client, media, start, length, write):
+    """Write exactly `length` bytes of `media` from `start`, fetching Telegram
+    parts with STREAM_WORKERS parallel requests and writing them strictly in
+    order. Buffer is bounded (≤ MAX_BUFFER_PARTS parts ahead of the writer)."""
+    total_parts = -(-length // PART_SIZE)
+    workers_n = min(STREAM_WORKERS, total_parts)
+    parts = {}
+    state = {"next": 0, "error": None, "closed": False}
+    cond = asyncio.Condition()
+
+    async def worker(first_part):
+        part = first_part
+        try:
+            while part < total_parts:
+                async with cond:
+                    await cond.wait_for(
+                        lambda: state["closed"] or part - state["next"] < MAX_BUFFER_PARTS
+                    )
+                    if state["closed"]:
+                        return
+                data = await _fetch_part(client, media, start + part * PART_SIZE,
+                                         min(PART_SIZE, length - part * PART_SIZE))
+                async with cond:
+                    parts[part] = data
+                    cond.notify_all()
+                part += workers_n
+        except Exception as exc:
+            async with cond:
+                state["error"] = exc
+                cond.notify_all()
+
+    workers = [asyncio.create_task(worker(w)) for w in range(workers_n)]
+    try:
+        while state["next"] < total_parts:
+            async with cond:
+                await cond.wait_for(
+                    lambda: state["closed"] or state["next"] in parts or state["error"] is not None
+                )
+                if state["closed"]:
+                    return
+                if state["next"] in parts:
+                    data = parts.pop(state["next"])
+                    state["next"] += 1
+                    cond.notify_all()
+                else:
+                    raise state["error"]
+            await write(data)
+    finally:
+        async with cond:
+            state["closed"] = True
+            cond.notify_all()
+        await asyncio.gather(*workers, return_exceptions=True)
+
+
+async def _fetch_message_for_link(bot, link):
+    try:
+        msg = await bot.client.get_messages(link["channel_id"], ids=link["message_id"])
+    except Exception:
+        log.exception("Could not fetch channel message %s for a link token", link.get("message_id"))
+        return None
+    if not msg or not getattr(msg, "media", None) or not getattr(msg, "file", None):
+        return None
+    return msg
+
+
+def _file_headers(msg, link, disposition_type, start, end, size, status):
+    filename = (msg.file.name if msg else None) or link.get("filename") or "file"
+    mime = (
+        (msg.file.mime_type if msg else None)
+        or link.get("mime")
+        or mimetypes.guess_type(filename)[0]
+        or "application/octet-stream"
+    )
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": mime,
+        "Content-Length": str(end - start + 1),
+        "Content-Disposition": _content_disposition(disposition_type, filename),
+    }
+    if status == 206:
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    return headers
+
+
+async def _head_file(request, disposition_type):
+    """Cheap HEAD probe — IDM/browsers ask for size before opening connections.
+    Must NOT trigger a Telegram download."""
+    bot = request.app["bot"]
+    link, err = await _lookup_link(request)
+    if err:
+        return err
+    msg = await _fetch_message_for_link(bot, link)
+    if msg is None and not link.get("size"):
+        return web.Response(
+            status=404,
+            text=error_page("File unavailable", "⚠️ File unavailable", "The stored file is no longer available on Telegram."),
+            content_type="text/html",
+        )
+    size = (msg.file.size if msg else 0) or link.get("size") or 0
+    headers = _file_headers(msg, link, disposition_type, 0, max(size - 1, 0), size, 200)
+    return web.Response(status=200, headers=headers)
+
+
 async def _stream_file(request, disposition_type):
     """Shared core for /dl (attachment) and /stream (inline for the player)."""
     bot = request.app["bot"]
     link, err = await _lookup_link(request)
     if err:
         return err
-    try:
-        msg = await bot.client.get_messages(link["channel_id"], ids=link["message_id"])
-    except Exception:
-        log.exception("Could not fetch channel message %s for a link token", link.get("message_id"))
-        msg = None
-    if not msg or not getattr(msg, "media", None) or not getattr(msg, "file", None):
+    msg = await _fetch_message_for_link(bot, link)
+    if msg is None:
         return web.Response(
             status=404,
             text=error_page("File unavailable", "⚠️ File unavailable", "The stored file is no longer available on Telegram."),
@@ -344,16 +458,8 @@ async def _stream_file(request, disposition_type):
 
     size = msg.file.size or link.get("size") or 0
     filename = msg.file.name or link.get("filename") or "file"
-    mime = (
-        msg.file.mime_type
-        or link.get("mime")
-        or mimetypes.guess_type(filename)[0]
-        or "application/octet-stream"
-    )
-
     start, end = 0, max(size - 1, 0)
     status = 200
-    headers = {"Accept-Ranges": "bytes"}
     range_header = request.headers.get("Range")
     if range_header and size > 0:
         try:
@@ -365,28 +471,12 @@ async def _stream_file(request, disposition_type):
                 headers={"Content-Range": f"bytes */{size}"},
                 text="Requested range not satisfiable",
             )
-    length = end - start + 1
-    headers["Content-Type"] = mime
-    headers["Content-Length"] = str(length)
-    headers["Content-Disposition"] = _content_disposition(disposition_type, filename)
-    if status == 206:
-        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    headers = _file_headers(msg, link, disposition_type, start, end, size, status)
 
     resp = web.StreamResponse(status=status, headers=headers)
     await resp.prepare(request)
     try:
-        # NB: telethon's iter_download `limit` counts CHUNKS, not bytes — so
-        # the exact byte range is enforced here by counting bytes ourselves.
-        remaining = length
-        async for chunk in bot.client.iter_download(msg.media, offset=start, chunk_size=CHUNK_SIZE):
-            if len(chunk) > remaining:
-                await resp.write(bytes(chunk[:remaining]))
-                remaining = 0
-            else:
-                await resp.write(chunk)
-                remaining -= len(chunk)
-            if remaining <= 0:
-                break
+        await _pump_range(bot.client, msg.media, start, end - start + 1, resp.write)
     except (ConnectionError, asyncio.CancelledError):
         log.info("Client disconnected while streaming %s", filename)
     except Exception:
@@ -402,8 +492,16 @@ async def download_handler(request):
     return await _stream_file(request, "attachment")
 
 
+async def download_head_handler(request):
+    return await _head_file(request, "attachment")
+
+
 async def stream_handler(request):
     return await _stream_file(request, "inline")
+
+
+async def stream_head_handler(request):
+    return await _head_file(request, "inline")
 
 
 async def watch_handler(request):
@@ -427,9 +525,13 @@ def create_app(bot):
     app.router.add_get("/health", health)
     app.router.add_get("/healthz", health)
     app.router.add_get("/verify/{token}", verify_handler)
-    app.router.add_get("/dl/{token}", download_handler)
-    app.router.add_get("/stream/{token}", stream_handler)
+    # allow_head=False + explicit HEAD routes: IDM/browsers probe with HEAD to
+    # get the file size first — that must answer headers WITHOUT downloading.
+    app.router.add_get("/dl/{token}", download_handler, allow_head=False)
+    app.router.add_get("/stream/{token}", stream_handler, allow_head=False)
     app.router.add_get("/watch/{token}", watch_handler)
+    app.router.add_route("HEAD", "/dl/{token}", download_head_handler)
+    app.router.add_route("HEAD", "/stream/{token}", stream_head_handler)
     return app
 
 

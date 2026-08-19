@@ -181,6 +181,7 @@ class FakeClient:
     def __init__(self, **file_kwargs):
         self.msg = FakeTGMessage(**file_kwargs)
         self.sent_files = []
+        self.iter_calls = []  # (offset, chunk_size) per Telegram part request
 
     async def get_messages(self, chat, ids=None):
         return self.msg
@@ -190,13 +191,24 @@ class FakeClient:
         return types.SimpleNamespace()
 
     def iter_download(self, media, offset=0, chunk_size=None, **_ignored):
-        # async generator, mirroring telethon.iter_download (call it -> async gen)
-        data = FILE_BYTES[offset:]
-        step = chunk_size or 256 * 1024
+        # async generator, mirroring telethon.iter_download (call it -> async gen).
+        # Byte at position i is i % 256 — identical to FILE_BYTES for its length,
+        # and valid for ANY file size, so multi-part fetches are testable.
+        self.iter_calls.append((offset, chunk_size))
+        size = self.msg.file.size
+        step = chunk_size or 512 * 1024
         async def gen():
-            for i in range(0, len(data), step):
-                yield data[i:i + step]
+            pos = offset
+            while pos < size:
+                n = min(step, size - pos)
+                yield bytes((pos + i) % 256 for i in range(n))
+                pos += n
         return gen()
+
+
+def expected_bytes(start, length):
+    """The procedural file bytes a correct stream must reproduce."""
+    return bytes((start + i) % 256 for i in range(length))
 
 
 def install_fakes(movie_docs, **file_kwargs):
@@ -418,6 +430,15 @@ def test_web_server_endpoints():
             r = await client.get("/dl/oldtoken")
             assert r.status == 410  # expired
 
+            # HEAD probe (IDM preflight): headers only, ZERO Telegram downloads
+            calls_before = len(bot_v2.client.iter_calls)
+            r = await client.head("/dl/goodtoken")
+            assert r.status == 200
+            assert r.headers["Content-Length"] == str(len(FILE_BYTES))
+            assert r.headers["Accept-Ranges"] == "bytes"
+            assert "attachment" in r.headers["Content-Disposition"]
+            assert len(bot_v2.client.iter_calls) == calls_before, "HEAD must not trigger a download"
+
             r = await client.get("/watch/goodtoken")
             assert r.status == 200
             html = await r.text()
@@ -437,7 +458,52 @@ def test_web_server_endpoints():
             assert "invalid or was already used" in await r.text()
 
     asyncio.run(main())
-    print("✅ web server: /health, /dl (200+206+416+404+410), /stream, /watch, /verify all pass")
+    print("✅ web server: /health, /dl (200+206+416+404+410), HEAD probe, /stream, /watch, /verify all pass")
+
+
+def test_parallel_multipart_streaming():
+    """Files bigger than one 512KB part are fetched with parallel part requests
+    and reassembled in exact order — the anti-slowdown pipeline."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    big_size = len(FILE_BYTES) + 12345  # 3 parts (512K + 512K + 12345)
+
+    async def main():
+        db = install_fakes([], name="big.movie.2024.1080p.mkv", size=big_size)
+        now = file_to_link.utcnow()
+        await db.file_links.insert_one({
+            "token": "bigtoken", "channel_id": -1001, "message_id": 9002,
+            "filename": "big.movie.2024.1080p.mkv", "size": big_size,
+            "mime": "video/x-matroska", "created_at": now,
+            "expires_at": now + timedelta(hours=48),
+        })
+        app = file_to_link.create_app(bot_v2)
+        async with TestClient(TestServer(app)) as client:
+            # full file: 3 parallel parts, byte-exact body
+            r = await client.get("/dl/bigtoken")
+            assert r.status == 200
+            assert r.headers["Content-Length"] == str(big_size)
+            body = await r.read()
+            assert body == expected_bytes(0, big_size), "multi-part body must be byte-exact"
+            assert len(bot_v2.client.iter_calls) == 3, bot_v2.client.iter_calls
+
+            # range crossing two parts
+            bot_v2.client.iter_calls.clear()
+            r = await client.get("/dl/bigtoken", headers={"Range": "bytes=300000-900000"})
+            assert r.status == 206
+            assert r.headers["Content-Range"] == f"bytes 300000-900000/{big_size}"
+            assert await r.read() == expected_bytes(300000, 600001)
+            assert len(bot_v2.client.iter_calls) == 2
+
+            # tiny unaligned range: exactly one part fetch, exact bytes
+            bot_v2.client.iter_calls.clear()
+            r = await client.get("/dl/bigtoken", headers={"Range": "bytes=13-357"})
+            assert r.status == 206
+            assert await r.read() == expected_bytes(13, 345)
+            assert len(bot_v2.client.iter_calls) == 1
+
+    asyncio.run(main())
+    print("✅ parallel streaming: 3-part file byte-exact, cross-part ranges exact, HEAD-free probes")
 
 
 if __name__ == "__main__":
@@ -449,4 +515,5 @@ if __name__ == "__main__":
     test_parse_range_header()
     test_delivery_attaches_links()
     test_web_server_endpoints()
+    test_parallel_multipart_streaming()
     print("\nALL HANDLER SMOKE TESTS PASSED")
