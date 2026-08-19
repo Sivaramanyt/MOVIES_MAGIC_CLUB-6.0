@@ -56,6 +56,7 @@ def canonical_movie_title(value: str) -> str:
     text = re.sub(r"\b(?:19|20)\d{2}\b", " ", text)
     text = re.sub(r"\b(?:2160p|1080p|720p|480p|360p|4k)\b", " ", text, flags=re.I)
     text = re.sub(r"\b\d+(?:\.\d+)?\s*(?:gb|gib|mb|mib)\b", " ", text, flags=re.I)
+    text = re.sub(r"\b(?:" + "|".join(re.escape(x) for x in LANGUAGES) + r")\b", " ", text, flags=re.I)
     text = re.sub(r"\b(?:" + "|".join(re.escape(x) for x in NOISE_WORDS) + r")\b", " ", text, flags=re.I)
     text = re.sub(r"\b\d+\b", " ", text)
     text = re.sub(r"[._+\-]+", " ", text)
@@ -66,26 +67,37 @@ def display_title(value: str) -> str:
     title = canonical_movie_title(value)
     return title.title() if title else clean_text(value).title()
 
+def detect_languages(text: str):
+    """Return every explicitly named language in the filename/caption, preserving LANGUAGES order."""
+    text = clean_text(text)
+    return [lang for lang in LANGUAGES if re.search(rf"\b{re.escape(lang)}\b", text, re.I)]
+
 def parse_metadata(text: str):
     text = clean_text(text)
     year_match = re.search(r"(?:19|20)\d{2}", text)
     year = int(year_match.group()) if year_match else None
-    language = next((x for x in LANGUAGES if re.search(rf"\b{re.escape(x)}\b", text, re.I)), None)
+    languages = detect_languages(text)
     quality_match = re.search(r"\b(2160p|4K|1080p|720p|480p|360p)\b", text, re.I)
-    quality = quality_match.group(1) if quality_match else None
-    title = re.sub(r"[._-]+", " ", text)
-    title = re.sub(r"\b(2160p|4K|1080p|720p|480p|360p)\b", " ", title, flags=re.I)
-    if year:
-        title = re.sub(rf"\b{year}\b", " ", title)
-    for lang in LANGUAGES:
-        title = re.sub(rf"\b{re.escape(lang)}\b", " ", title, flags=re.I)
-    return clean_text(title) or text, year, language, quality
+    if quality_match:
+        quality = quality_match.group(1)
+    elif re.search(r"\bweb[- ]?dl\b|\bwebdl\b", text, re.I):
+        quality = "WEB-DL"
+    elif re.search(r"\bhdrip\b", text, re.I):
+        quality = "HDRip"
+    elif re.search(r"\bbluray\b|\bbrrip\b", text, re.I):
+        quality = "BluRay"
+    else:
+        quality = None
+    title = canonical_movie_title(text)
+    return display_title(title), year, languages, quality
 
 def metadata_from_message(message):
     caption = message.raw_text or ""
     filename = message.file.name if message.file else None
     source = filename or caption or "Unknown"
-    title, year, language, quality = parse_metadata(source)
+    title, year, languages, quality = parse_metadata(source)
+    if not languages:
+        languages = detect_languages(caption)
     overrides = {
         "year": r"(?:year)\s*[:=-]\s*((?:19|20)\d{2})",
         "language": r"(?:language|lang)\s*[:=-]\s*([^\n|]+)",
@@ -96,13 +108,17 @@ def metadata_from_message(message):
         if match:
             value = clean_text(match.group(1))
             if key == "year": year = int(value)
-            elif key == "language": language = value
+            elif key == "language":
+                override_languages = [x for x in LANGUAGES if re.search(rf"\b{re.escape(x)}\b", value, re.I)]
+                languages = override_languages or [value]
             else: quality = value
+    primary_language = languages[0] if languages else "Unknown"
     return {
         "title": title,
         "title_normalized": normalize_title(title),
         "year": year,
-        "language": language or "Unknown",
+        "language": primary_language,
+        "languages": languages or ["Unknown"],
         "quality": quality or "Unknown",
         "channel_id": STORAGE_CHANNEL_ID,
         "message_id": message.id,
@@ -116,7 +132,7 @@ async def index_message(message):
         return False
     data = metadata_from_message(message)
     await movies.update_one({"channel_id": STORAGE_CHANNEL_ID, "message_id": message.id}, {"$set": data}, upsert=True)
-    log.info("Indexed message %s: %s | %s | %s | %s", message.id, data["title"], data["year"], data["language"], data["quality"])
+    log.info("Indexed message %s: %s | %s | %s | %s", message.id, data["title"], data["year"], ",".join(data["languages"]), data["quality"])
     return True
 
 async def remove_message(message_id: int):
@@ -145,7 +161,7 @@ async def search_movies(query: str):
     if not normalized: return []
     words = normalized.split()
     pattern = ".*" + ".*".join(re.escape(w) for w in words) + ".*"
-    docs = await movies.find({"enabled": True, "title_normalized": {"$regex": pattern}}, {"title": 1, "year": 1, "language": 1, "quality": 1, "message_id": 1, "filename": 1}).sort([("year", -1), ("title", 1)]).limit(SEARCH_LIMIT).to_list(length=SEARCH_LIMIT)
+    docs = await movies.find({"enabled": True, "title_normalized": {"$regex": pattern}}, {"title": 1, "year": 1, "language": 1, "languages": 1, "quality": 1, "message_id": 1, "filename": 1}).sort([("year", -1), ("title", 1)]).limit(SEARCH_LIMIT).to_list(length=SEARCH_LIMIT)
     groups = {}
     for doc in docs:
         title_key = canonical_movie_title(doc.get("title") or doc.get("filename") or "")
@@ -160,10 +176,9 @@ def result_buttons(items):
     return [[Button.inline(f"🎬 {item['title']} ({item.get('year') or 'Year unknown'}) • {item['file_count']} files"[:64], data=f"movie:{item['_id']}")] for item in items]
 
 async def group_files(base):
-    """Find files by logical title/year. This deliberately does NOT use the raw title as the group key."""
     key = canonical_movie_title(base.get("title") or base.get("filename") or "")
     query = {"enabled": True, "year": base.get("year")} if base.get("year") is not None else {"enabled": True}
-    candidates = await movies.find(query, {"title": 1, "filename": 1, "year": 1, "language": 1, "quality": 1, "message_id": 1}).limit(SEARCH_LIMIT * 5).to_list(length=SEARCH_LIMIT * 5)
+    candidates = await movies.find(query, {"title": 1, "filename": 1, "year": 1, "language": 1, "languages": 1, "quality": 1, "message_id": 1}).limit(SEARCH_LIMIT * 5).to_list(length=SEARCH_LIMIT * 5)
     return [d for d in candidates if canonical_movie_title(d.get("title") or d.get("filename") or "") == key]
 
 @client.on(events.NewMessage(pattern=r"^/start$"))
@@ -198,14 +213,14 @@ async def add_existing(event):
     if len(parts) != 5:
         await event.respond("Usage: `/add <message_id> | title | year | language | quality`"); return
     message_id, title, year, language, quality = parts
-    try:
-        message_id = int(message_id); year = int(year); message = await client.get_messages(STORAGE_CHANNEL_ID, ids=message_id)
+    try: message_id = int(message_id); year = int(year); message = await client.get_messages(STORAGE_CHANNEL_ID, ids=message_id)
     except (ValueError, TypeError): await event.respond("Message ID and year must be numbers."); return
     except Exception: await event.respond("Could not read that storage-channel message."); return
     if not message or not message.media: await event.respond("That channel message does not contain media."); return
-    data = {"title": title, "title_normalized": normalize_title(title), "year": year, "language": language, "quality": quality, "channel_id": STORAGE_CHANNEL_ID, "message_id": message_id, "filename": message.file.name if message.file else "Unknown", "created_at": datetime.now(timezone.utc), "enabled": True}
+    langs = [x for x in LANGUAGES if re.search(rf"\b{re.escape(x)}\b", language, re.I)] or [language]
+    data = {"title": title, "title_normalized": normalize_title(title), "year": year, "language": langs[0], "languages": langs, "quality": quality, "channel_id": STORAGE_CHANNEL_ID, "message_id": message_id, "filename": message.file.name if message.file else "Unknown", "created_at": datetime.now(timezone.utc), "enabled": True}
     await movies.update_one({"channel_id": STORAGE_CHANNEL_ID, "message_id": message_id}, {"$set": data}, upsert=True)
-    await event.respond(f"✅ Added **{title} ({year})** — {language} — {quality}")
+    await event.respond(f"✅ Added **{title} ({year})** — {', '.join(langs)} — {quality}")
 
 @client.on(events.NewMessage)
 async def movie_search(event):
@@ -224,7 +239,7 @@ async def choose_movie(event):
     if not doc: await event.answer("Movie is no longer available.", alert=True); return
     group_docs = await group_files(doc)
     if not group_docs: await event.answer("Movie files are no longer available.", alert=True); return
-    languages = sorted({d.get("language", "Unknown") for d in group_docs}, key=str.lower)
+    languages = sorted({lang for d in group_docs for lang in (d.get("languages") or ([d.get("language")] if d.get("language") else ["Unknown"]))}, key=str.lower)
     buttons = [Button.inline(lang[:50], data=f"lang:{doc['_id']}:{i}") for i, lang in enumerate(languages)]
     title = display_title(doc.get("title") or doc.get("filename") or "Movie"); year = doc.get("year") or "Year unknown"
     await event.edit(f"🎬 **{title} ({year})**\n📁 **{len(group_docs)} files found**\n\n🌐 **Select language:**", buttons=[buttons[i:i+2] for i in range(0, len(buttons), 2)]); await event.answer()
@@ -235,10 +250,11 @@ async def choose_language(event):
     try: base = await movies.find_one({"_id": ObjectId(movie_id), "enabled": True})
     except Exception: base = None
     if not base: await event.answer("Movie is no longer available.", alert=True); return
-    group_docs = await group_files(base); languages = sorted({d.get("language", "Unknown") for d in group_docs}, key=str.lower)
+    group_docs = await group_files(base)
+    languages = sorted({lang for d in group_docs for lang in (d.get("languages") or ([d.get("language")] if d.get("language") else ["Unknown"]))}, key=str.lower)
     if lang_index >= len(languages): await event.answer("Language option expired. Search again.", alert=True); return
     language = languages[lang_index]
-    qualities = sorted({d.get("quality", "Unknown") for d in group_docs if d.get("language", "Unknown") == language}, key=str.lower)
+    qualities = sorted({d.get("quality", "Unknown") for d in group_docs if language in (d.get("languages") or ([d.get("language")] if d.get("language") else ["Unknown"]))}, key=str.lower)
     buttons = [Button.inline(q[:50], data=f"quality:{movie_id}:{lang_index}:{i}") for i, q in enumerate(qualities)]
     title = display_title(base.get("title") or base.get("filename") or "Movie"); year = base.get("year") or "Year unknown"
     await event.edit(f"🎬 **{title} ({year})**\n📁 **{len(group_docs)} files found**\n🌐 Language: **{language}**\n\n📺 **Select quality:**", buttons=[buttons[i:i+2] for i in range(0, len(buttons), 2)]); await event.answer()
@@ -249,13 +265,14 @@ async def choose_quality(event):
     try: base = await movies.find_one({"_id": ObjectId(movie_id), "enabled": True})
     except Exception: base = None
     if not base: await event.answer("Movie is no longer available.", alert=True); return
-    group_docs = await group_files(base); languages = sorted({d.get("language", "Unknown") for d in group_docs}, key=str.lower)
+    group_docs = await group_files(base)
+    languages = sorted({lang for d in group_docs for lang in (d.get("languages") or ([d.get("language")] if d.get("language") else ["Unknown"]))}, key=str.lower)
     if lang_index >= len(languages): await event.answer("Language option expired. Search again.", alert=True); return
     language = languages[lang_index]
-    qualities = sorted({d.get("quality", "Unknown") for d in group_docs if d.get("language", "Unknown") == language}, key=str.lower)
+    qualities = sorted({d.get("quality", "Unknown") for d in group_docs if language in (d.get("languages") or ([d.get("language")] if d.get("language") else ["Unknown"]))}, key=str.lower)
     if quality_index >= len(qualities): await event.answer("Quality option expired. Search again.", alert=True); return
     quality = qualities[quality_index]
-    matching = [d for d in group_docs if d.get("language", "Unknown") == language and d.get("quality", "Unknown") == quality]
+    matching = [d for d in group_docs if language in (d.get("languages") or ([d.get("language")] if d.get("language") else ["Unknown"])) and d.get("quality", "Unknown") == quality]
     if not matching: await event.answer("That version is no longer available.", alert=True); return
     doc = matching[0]
     await event.edit("📤 **Preparing your file...** Please wait.")
