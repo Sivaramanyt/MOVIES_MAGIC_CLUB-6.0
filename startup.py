@@ -6,7 +6,8 @@ from telethon.errors import FloodWaitError
 
 from health_server import run_health_server
 
-# Koyeb health endpoint must be available immediately.
+# Koyeb health endpoint must be available immediately. bot_v2 must not start
+# another copy of the health server.
 threading.Thread(target=run_health_server, daemon=True).start()
 print("Health server started early", flush=True)
 
@@ -34,8 +35,8 @@ import normalization_patch
 normalization_patch.install(bot_v2)
 
 
-async def normalize_before_bot():
-    print("Starting movie title normalization...", flush=True)
+async def background_normalization():
+    print("Starting background movie title normalization...", flush=True)
     try:
         updated = await normalization_patch.migrate_existing_movies(bot_v2)
         print(
@@ -43,18 +44,18 @@ async def normalize_before_bot():
             flush=True,
         )
     except Exception:
-        bot_v2.log.exception("Movie title normalization failed")
-        raise
+        # Never take the Telegram bot offline because of a migration problem.
+        bot_v2.log.exception("Background movie title normalization failed")
 
 
 async def main():
-    # The health endpoint is already live, so Koyeb remains healthy while the
-    # one-time MongoDB cleanup runs. Starting Telegram after the cleanup makes
-    # the search UI deterministic: old release filenames cannot leak into the
-    # first search result.
-    await normalize_before_bot()
+    # Telegram starts first. MongoDB cleanup runs independently so a large
+    # collection can never prevent the bot from responding.
     print("Starting Telegram bot...", flush=True)
-    await bot_v2.main()
+    bot_task = asyncio.create_task(bot_v2.main())
+    await asyncio.sleep(0.1)
+    asyncio.create_task(background_normalization())
+    await bot_task
 
 
 if __name__ == "__main__":
